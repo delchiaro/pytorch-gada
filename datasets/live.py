@@ -2,7 +2,7 @@
 from pathlib import Path
 import numpy as np
 
-from gada.gadaset import GADAsetFactory
+from datasets.gadaset import GADAsetFactory
 
 
 class LIVE(GADAsetFactory):

@@ -1,5 +1,5 @@
 from gada.wgada import train_WGADA
-from run_settings import device, log_dir, crop_dim, nb_dist,  wgada, trainset, testset, state_dir, jpeg_grid
+from zrun_settings import device, log_dir, crop_dim, nb_dist,  wgada, trainset, testset, state_dir, jpeg_grid
 from gada import train_GADA
 
 print(wgada.G)

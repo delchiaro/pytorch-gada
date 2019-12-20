@@ -1,7 +1,6 @@
-from dataset_waterloo import WATERLOO
+from datasets.waterloo import WATERLOO
 from gada.gada import finetune_GADA
-from run_settings import device, log_dir, crop_dim, nb_dist, gada, trainset, testset, state_dir, jpeg_grid,  state_timestamp_test, state_epoch_test
-from gada import train_GADA
+from zrun_settings import crop_dim, gada, testset, state_dir, jpeg_grid
 
 print(gada.G)
 gada.summary(crop_dim, channels=3, print_params=True)

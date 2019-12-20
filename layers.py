@@ -3,8 +3,7 @@ from torch import nn
 from numbers import Number
 from fastorch import fastSequential
 from fastorch.summary import summary
-
-from gada.utils import index_to_1hot
+from utils import index_to_1hot
 
 
 def NP(tensor):

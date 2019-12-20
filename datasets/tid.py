@@ -1,14 +1,6 @@
-import time
-from copy import copy, deepcopy
-from os.path import join
 from pathlib import Path
-import pandas as pd
-import numpy as np
-from imageio import imread
-import time
-import multiprocessing as mp
 
-from gada.gadaset import GADAsetFactory
+from datasets.gadaset import GADAsetFactory
 
 #
 # class ImageLoader:
@@ -27,23 +19,25 @@ from gada.gadaset import GADAsetFactory
 
 
 
-class WATERLOO(GADAsetFactory):
+class TID2013(GADAsetFactory):
 
     def __init__(self, dataset_path, load_dataset=False):
         self.path = Path(dataset_path)
         super().__init__(load_dataset)
 
     def _init(self, metadata) -> dict:
-        import os
-        dist_im_names = np.array([im_name for im_name in sorted(os.listdir(self.path/'pristine_images')) if im_name.endswith('.bmp')])
-        ref_im_names = deepcopy(dist_im_names)
-        dist_level = np.array([.0 for im in dist_im_names])
-        dist_categ = np.array([0 for im in dist_im_names])
+        lines = open(self.path / 'mos_with_names.txt', 'r').read().split('\n')
+        lines.remove('')
+        dist_im_names = [l.split(' ')[1] for l in lines]
+        dist_level = [float(l.split(' ')[0])/9 for l in lines]
+        ref_im_names = [n.split('_')[0].upper() + '.BMP' for n in dist_im_names]
+        dist_categ = [int(n.split('.')[0].split('_')[1])-1 for n in dist_im_names]
+        #dist_level = [float(n.split('.')[0].split('_')[2])/5 for n in dist_im_names]
 
-        metadata = {WATERLOO.COL_DISTORTED_NAME: dist_im_names,
-                    WATERLOO.COL_REFERENCE_NAME: ref_im_names,
-                    WATERLOO.COL_DISTORTION_CATEG: dist_categ,
-                    WATERLOO.COL_DISTORTION_LEVEL: dist_level}
+        metadata = {TID2013.COL_DISTORTED_NAME: dist_im_names,
+                    TID2013.COL_REFERENCE_NAME: ref_im_names,
+                    TID2013.COL_DISTORTION_CATEG: dist_categ,
+                    TID2013.COL_DISTORTION_LEVEL: dist_level}
         return metadata
     #
     # def _load_images(self, threads, verbose, **kwargs):
@@ -67,8 +61,8 @@ class WATERLOO(GADAsetFactory):
     #     return np.array(ref, dtype=np.uint8), np.array(dist, dtype=np.uint8)
 
     def _load_images(self, threads, verbose, **kwargs):
-        dist_path = self.path/'pristine_images'
-        ref_path = self.path/'pristine_images'
+        dist_path = self.path/'distorted_images'
+        ref_path = self.path/'reference_images'
         return self._load_images_helper(ref_path, dist_path, threads, verbose)
 
     def __repr__(self):
@@ -85,21 +79,28 @@ class WATERLOO(GADAsetFactory):
 if __name__ == "__main__":
 
     #%%
-    waterloo = WATERLOO('/mnt/2tb/datasets/IQA/WATERLOO/').init()
-    waterloo.load_images(verbose=True)
-    print(waterloo)
-    #splits = waterloo.generate_ref_splits('./data/waterloo_split', ref_imgs_per_split=5, n_splits=10, save=True)
-    #splits_loaded = waterloo.load_ref_splits('./data/waterloo_split')
+    tid = TID2013('/mnt/2tb/datasets/IQA/tid2013/').init()
+    tid.load_images()
+    print(tid)
+    splits = tid.generate_ref_splits('./data/tid_splits', ref_imgs_per_split=5, n_splits=10, save=True)
+    splits_loaded = tid.load_ref_splits('./data/tid_splits')
 
-    #train, val = waterloo.train_test_split_by_ref(n_random=5, specify='test')
+    train, val = tid.train_test_split_by_ref(n_random=5, specify='test')
 
-    #train.save('train.pickle')
-   # waterloo.load('train.pickle')
+    train.save('train.pickle')
+    tid.load('train.pickle')
+
+    #%%
+    tid_train = TID2013('/mnt/2tb/datasets/IQA/tid2013/').load('tid_train_2200.pickle')
+    tid_test = TID2013('/mnt/2tb/datasets/IQA/tid2013/').load('tid_test_800.pickle')
+    tid_train.save_ref_split('tid_train_2200.split')
+    tid_test.save_ref_split('tid_test_800.split')
+
 
     #%%
 
 
     #%%
-
-
-    #%%
+    tid = TID2013('/mnt/2tb/datasets/IQA/tid2013/').load('tid.pickle')
+    tid_train = tid.load_split('tid_train_2200.split')
+    tid_test = tid.load_split('tid_test_800.split')

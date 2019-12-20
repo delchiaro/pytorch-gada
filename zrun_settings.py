@@ -1,8 +1,7 @@
 import torch
-from torch import optim
 
-from dataset_live import LIVE
-from dataset_tid import TID2013
+from datasets.live import LIVE
+from datasets.tid import TID2013
 import numpy as np
 
 from gada.wgada import WGADA, WGANMode
@@ -59,8 +58,6 @@ testset = splits[1]['test'].load_images(verbose=True)
 jpeg_grid = True
 crop_dim = 128
 
-from gada import GADA
-
 GPU = 0
 device = exp_init(gpu_index=GPU, seed=42)
 # gada = GADA(nb_distortions=nb_dist,
@@ -92,3 +89,5 @@ state_epoch_test = 9000
 
 state_timestamp_test = '2019-09-12_17:25:30'
 state_epoch_test = 16000
+
+

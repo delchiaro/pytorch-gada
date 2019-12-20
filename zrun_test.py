@@ -1,4 +1,4 @@
-from run_settings import device, log_dir, crop_dim, nb_dist, wgada, trainset, testset, state_dir, state_timestamp_test, state_epoch_test, jpeg_grid
+from zrun_settings import device, log_dir, crop_dim, nb_dist, wgada, trainset, testset, state_dir, state_timestamp_test, state_epoch_test, jpeg_grid
 from gada import plot_GADA_gen_imgs, test_GADA
 from gada.wgada import plot_WGADA_gen_imgs
 

@@ -1,119 +1,114 @@
-from copy import deepcopy
-from enum import Enum
 from functools import reduce
 from itertools import chain
 from os.path import join
-from typing import List, Callable, Iterator
-from torch import optim
+from typing import List
 import torch
 from tensorboardX import SummaryWriter
 from torch import nn
 
-from fastorch import fastSequential
 from fastorch.summary import summary
-from gada import Generator, Discriminator, Classifier, Evaluator, FeatureExtractor
 from gada.networks import UNet, FullyConvFeatExtractor, FullyConvFC
-from gada.utils import set_requires_grad, to_float32, to_device, index_to_1hot
-from .gadaset import GADAsetFactory
+from gada.utils import to_float32, to_device, index_to_1hot
+from datasets.gadaset import GADAsetFactory
 import time, datetime
-from torch.utils.data import DataLoader, Dataset, TensorDataset, ConcatDataset
+from torch.utils.data import DataLoader
 from torch.nn import functional as NN
+from torch import autograd
+import torch.distributions as tdist
 
 
-class TrainStepStyle(Enum):
-    pytorch = 0
-    tensorflow = 1
+def calc_gradient_penalty(netD, real_data, fake_data, batch_size, lmbda, device=None):
+    # print real_data.size()
+    alpha = torch.rand(batch_size, 1)
+    alpha = alpha.expand(batch_size, real_data.nelement()//batch_size).contiguous().view(*real_data.shape)
+    alpha = alpha.to(device)
+
+    interpolates = (alpha * real_data + ((1 - alpha) * fake_data)).to(device)
+
+    interpolates = autograd.Variable(interpolates, requires_grad=True)
+
+    disc_interpolates = netD(interpolates)
+
+    gradients = autograd.grad(outputs=disc_interpolates, inputs=interpolates,
+                              grad_outputs=torch.ones(disc_interpolates.size()).to(device),
+                              create_graph=True, retain_graph=True, only_inputs=True)[0]
+
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * lmbda
+    return gradient_penalty
 
 
-#crop_pred_size = None,  # (128,1) is the default --> discr_last_kernel = 16 with 3 convs.
+class WGANMode(enumerate):
+    clipping=0
+    penalty=1
 
-
-# if discr_filters is None:
-#     discr_filters = gen_filters
-#
-# if crop_pred_size is not None:
-#     if discr_last_kernel != None:
-#         raise ValueError("crop_pred_sizes is used to automatically compute discr_last_kernel, can't use both parameters.")
-#     discr_last_kernel = (crop_pred_size[0] / (2 ** len(discr_filters))) / crop_pred_size[1]
-#
-#     print(f"taregt crop_size = {crop_pred_size[0]}")
-#     print(f"taregt pred_size = {crop_pred_size[1]}")
-#     print(f"gen_filters = {gen_filters}   --> nb_convs={len(discr_filters)} --> out_dim={crop_pred_size[0] / (2 ** len(discr_filters))}")
-#     print(f"discr_last_kernel = {discr_last_kernel}")
-#     if not discr_last_kernel.is_integer():
-#         raise ValueError(f"crop_pred_sizes should compute an integer to be assigned to discr_last_kernel. Selected combination"
-#                          f"of dimensions don't give an integer:\n"
-#                          f"Please use a target crop_dim and target pred_dim that is an exponent of 2 and greater than: \n"
-#                          f"   (2^nb_convs)*pred_dim   i.e.: 2^{len(discr_filters)} * {crop_pred_size[1]}\n")
-#
-#     discr_last_kernel = int(discr_last_kernel)
-#
-class GADA(nn.Module):
-    G_LAMBDA_RECONSTRUCTION = 255
-
-
+class WGADA(nn.Module):
+    G_LAMBDA_RECONSTRUCTION = 1
     def __init__(self,
                  nb_distortions=24,
                  z_noise_dim=96,
                  lr=1e-4,
-                 target_im_size=128, # (minimum) width and height of input images
+                 target_im_size=128,  # (minimum) width and height of input images
                  g_blocks=(64, 128, 256, 256),
                  f_blocks=None,
-                 dist_level_emb_size=32,
-                 dist_categ_emb_size=32,
+                 dist_level_emb_repeat=32,
+                 dist_categ_emb_repeat=6,
                  discr_last_kernel=None,  # 16 is the default with 3 convs for discriminator, so that 128x128 crops become 16x16 -> 1x1 !
-                 train_step_style=TrainStepStyle.pytorch,
                  g_disable_skip_connections=False,
+                 wgan_mode: WGANMode = WGANMode.clipping,
+                 clipping_value=.01,
+                 grad_penalty_lambda=1,
+                 use_resize_conv=False,
                  device=None):
         super().__init__()
-        self.device = device
-        self.nb_distortions=nb_distortions
-        self.target_im_size=target_im_size
-        #
-        #
-        # self.F = FeatureExtractor(out_features=1024, filters=discr_filters, last_kernel_size=discr_last_kernel, device=device)
-        # self.D = Discriminator(in_features=1024, device=device)
-        # self.C = Classifier(nb_distortions, in_features=1024, device=device)
-        # self.E = Evaluator(in_features=1024, device=device)
-        # self.G = Generator(nb_distortions, z_noise_dim, img_channels=3, filters=gen_filters, device=device)
         f_blocks = g_blocks if f_blocks is None else f_blocks
         self.g_blocks = g_blocks
         self.f_blocks = f_blocks
         self.z_dim = z_noise_dim
-        self.dist_level_in_embedding, self.dist_level_in_embedding_size = \
-            fastSequential([nb_distortions, 'relu', nb_distortions, 'relu'], input_shape=1)
-        self.dist_level_out_embedding, self.dist_level_out_embedding_size = \
-            fastSequential([dist_level_emb_size, 'relu', dist_level_emb_size, 'relu'], input_shape=1)
-        self.dist_categ_out_embedding, self.dist_categ_out_embedding_size = \
-            fastSequential([dist_categ_emb_size, 'relu', dist_categ_emb_size, 'relu'], input_shape=nb_distortions)
+
+        self.device = device
+        self.nb_distortions = nb_distortions
+        self.target_im_size = target_im_size
+        self._grad_penalty_lambda = grad_penalty_lambda
+        self._clipping_value = clipping_value
+        self.wgan_mode = wgan_mode
+
+        self.dist_level_emb_repeat = dist_level_emb_repeat
+        self.dist_categ_emb_repeat = dist_categ_emb_repeat
+        # self.dist_level_in_embedding, self.dist_level_in_embedding_size = \
+        #     fastSequential([nb_distortions, 'relu', nb_distortions, 'relu'], input_shape=1)
+        # self.dist_level_out_embedding, self.dist_level_out_embedding_size = \
+        #     fastSequential([dist_level_emb_repeat, 'relu', dist_level_emb_repeat, 'relu'], input_shape=1)
+        # self.dist_categ_out_embedding, self.dist_categ_out_embedding_size = \
+        #     fastSequential([dist_categ_emb_repeat, 'relu', dist_categ_emb_repeat, 'relu'], input_shape=nb_distortions)
 
         self.G = UNet(g_blocks,
                       input_channels=3+nb_distortions*2,
                       output_channels=3,
-                      cat_embedding_channels=dist_level_emb_size + dist_categ_emb_size + z_noise_dim,
+                      default_stride=2,
+                      kernel_size=4,
+                      cat_embedding_channels=dist_level_emb_repeat + dist_categ_emb_repeat*nb_distortions + z_noise_dim,
                       disable_skip_connections=g_disable_skip_connections,
+                      use_resize_conv=use_resize_conv,
                       append_layer=nn.Sigmoid())
 
         self.F = FullyConvFeatExtractor(target_im_size, f_blocks, input_channels=3, disable_full_size_conv=True)
-        self.D = FullyConvFC(self.F.output_channels, 1, append_layer=nn.Sigmoid())
+        self.D = FullyConvFC(self.F.output_channels, 1)
         self.C = FullyConvFC(self.F.output_channels, nb_distortions)
         self.E = FullyConvFC(self.F.output_channels, 1, append_layer=nn.Sigmoid())
 
-        import torch.distributions as tdist
         self.z_noise_distribution = tdist.Normal(0, 0.1) # mean=0, stddev=0.1
 
-        self.train_step_style = train_step_style
-
-        self.opt_d = torch.optim.Adam(chain(self.F.parameters(), self.D.parameters(), self.E.parameters(), self.C.parameters()),
-                                      lr=lr * .1, betas=(0.5, 0.999))
+        self.opt_d = torch.optim.Adam(chain(*[N.parameters() for N in [self.F, self.D, self.E, self.C]]), lr=lr * .1, betas=(0.5, 0.999))
         self.opt_g = torch.optim.Adam(self.G.parameters(), lr=lr * 1, betas=(0.5, 0.999))
-        if train_step_style is TrainStepStyle.tensorflow:
-            self.opt_q = torch.optim.Adam(self.parameters(), lr=lr * 1, betas=(0.5, 0.999))
-        elif train_step_style is TrainStepStyle.pytorch:
-            self.opt_q = None
 
+        #self._reconstruction_criterion = lambda im_pred, im_true: (im_pred - im_true).abs().mean()
+        self._reconstruction_criterion = lambda im_pred, im_true: NN.l1_loss(im_pred, im_true)
+        self._classification_criterion = nn.CrossEntropyLoss()
+        self._evaluation_criterion = lambda y_pred, y_true: (y_pred - y_true).abs().mean()
+
+        self.__one = torch.FloatTensor([1]).to(device)
+        self.__mone = self.__one * -1
         self.to(device)
-
 
     def summary(self, crop_size=128, channels=3, print_params=False):
         #x = torch.zeros(2, channels+self.nb_dist_categs*2, crop_size, crop_size)
@@ -153,18 +148,25 @@ class GADA(nn.Module):
     def distortion_embeddings(self, y_dist_categ, y_dist_level, im_tensor_shape):
         ################## ENCODER Input Embedding #####################
         dcateg_onehot = index_to_1hot(y_dist_categ[:, 0].long(), self.nb_distortions).float()
-        dlevel_input_emb = self.dist_level_in_embedding(y_dist_level)
+        # dlevel_input_emb = self.dist_level_in_embedding(y_dist_level)
+        # dcateg_dlevel_enc_emb = torch.cat((dcateg_onehot, dlevel_input_emb), dim=1)
+        # dcateg_dlevel_enc_emb = dcateg_dlevel_enc_emb.unsqueeze(-1).unsqueeze(-1).expand((-1, -1, im_tensor_shape[2], im_tensor_shape[3]))
+        dlevel_input_emb =  torch.repeat_interleave(y_dist_level, self.nb_distortions, 1)
         dcateg_dlevel_enc_emb = torch.cat((dcateg_onehot, dlevel_input_emb), dim=1)
         dcateg_dlevel_enc_emb = dcateg_dlevel_enc_emb.unsqueeze(-1).unsqueeze(-1).expand((-1, -1, im_tensor_shape[2], im_tensor_shape[3]))
 
         ################## DECODER Input Embedding #####################
         enc_shape = self.encoder_shape(im_tensor_shape)
-        # Embedding distortion level and category
-        dlevel_emb_out = self.dist_level_out_embedding(y_dist_level)
-        dcateg_emb_out = self.dist_categ_out_embedding(dcateg_onehot)
+        # # Embedding distortion level and category
+        # dlevel_emb_out = self.dist_level_out_embedding(y_dist_level)
+        # dcateg_emb_out = self.dist_categ_out_embedding(dcateg_onehot)
+        # dcateg_dlevel_dec_emb = torch.cat((dcateg_emb_out, dlevel_emb_out), dim=1)
+        # dcateg_dlevel_dec_emb = dcateg_dlevel_dec_emb.unsqueeze(-1).unsqueeze(-1).expand((-1, -1, enc_shape[2], enc_shape[3]))
+        # # Preparing decoder input using the embedding of distortion level/category concatenated to the encoder output and a noise vector.
+        dlevel_emb_out = torch.repeat_interleave(y_dist_level, self.dist_level_emb_repeat, 1)
+        dcateg_emb_out = torch.repeat_interleave(dcateg_onehot, self.dist_categ_emb_repeat, 1)
         dcateg_dlevel_dec_emb = torch.cat((dcateg_emb_out, dlevel_emb_out), dim=1)
         dcateg_dlevel_dec_emb = dcateg_dlevel_dec_emb.unsqueeze(-1).unsqueeze(-1).expand((-1, -1, enc_shape[2], enc_shape[3]))
-        # Preparing decoder input using the embedding of distortion level/category concatenated to the encoder output and a noise vector.
 
         return dcateg_dlevel_enc_emb, dcateg_dlevel_dec_emb
 
@@ -180,7 +182,6 @@ class GADA(nn.Module):
         enc_emb, dec_emb = self.distortion_embeddings(y_dist_categ, y_dist_level, im_shape)
         encoder_input = torch.cat((x_ref, enc_emb), dim=1)
         decoder_extra_input = torch.cat((dec_emb, z_noise), dim=1)
-
         fake_img = self.G.forward(encoder_input, decoder_extra_input)
         return fake_img
 
@@ -212,225 +213,126 @@ class GADA(nn.Module):
         return fake_pred, real_pred
 
 
-    def train_step(self, x_ref, x_dist, y_dist_categ, y_dist_level, ret_losses=True):
-        if self.train_step_style is TrainStepStyle.pytorch:
-            return self._train_step_pytorch(x_ref, x_dist, y_dist_categ, y_dist_level, ret_losses)
-        elif self.train_step_style is TrainStepStyle.tensorflow:
-            return self._train_step_tensorflow(x_ref, x_dist, y_dist_categ, y_dist_level, ret_losses)
-        else:
-            raise ValueError
 
-    def _train_step_tensorflow(self, x_ref, x_dist, y_dist_categ, y_dist_level, ret_losses=True):
+
+    def generator_train_step(self, x_ref, x_dist, y_dist_categ, y_dist_level, ret_losses=True):
         im_shape = x_ref.shape
 
-        z_noise = self.generate_znoise_vector(im_shape, im_shape[0])
-        fake_img = self.generator_step(x_ref, y_dist_categ, y_dist_level, z_noise)
-
-        zeros = torch.zeros(len(x_ref), 1)
-        ones = torch.ones(len(x_ref), 1)
-
-        adversarial_criterion = nn.BCELoss()
-        classification_criterion = nn.CrossEntropyLoss()
-        reconstruction_criterion =  lambda im_pred, im_true: (im_pred-im_true).abs().mean()
-        evaluation_criterion = lambda y_pred, y_true: (y_pred-y_true).abs().mean()
-        #evaluator_criterion = lambda y_pred, y_true:  NN.mse_loss(y_pred, y_true)
-
-        ############################################## D Losses
-        self.opt_d.zero_grad()
-        # Discriminator on Fake features
-        d_fake_feat = self.F.forward(fake_img.detach())  # stop backprop to the generator by detaching fake_img
-        d_confidence_fake = self.D.forward(d_fake_feat)
-        d_spot_g_loss = adversarial_criterion(d_confidence_fake, zeros)
-
-        # Discriminator on Real features
-        d_real_feat = self.F.forward(x_dist)
-        d_confidence_real = self.D.forward(d_real_feat)
-        d_spot_real_loss = adversarial_criterion(d_confidence_real, ones)
-
-        d_loss = d_spot_g_loss + d_spot_real_loss
-        d_loss.backward()
-        self.opt_d.step()
-
-
-        ############################################## G Loss
-        self.opt_g.zero_grad()
-        g_fake_feat = self.F.forward(fake_img)
-        g_fake_confidence = self.D.forward(g_fake_feat)
-
-        g_loss_l1 = reconstruction_criterion(fake_img, x_dist) * GADA.G_LAMBDA_RECONSTRUCTION
-        g_loss_fooling_d = adversarial_criterion(g_fake_confidence, ones)
-        g_loss = g_loss_l1 + g_loss_fooling_d
-
-        g_loss.backward(retain_graph=True)
-        self.opt_g.step()
-
-
-        ############################################## C-E (Q) Losse
-        self.opt_q.zero_grad()
-        q_fake_feat = self.F.forward(fake_img)
-        q_dist_categ_fake = self.C.forward(q_fake_feat)
-        q_dist_level_fake = self.E.forward(q_fake_feat)
-        qc_loss_fake =  classification_criterion(q_dist_categ_fake, y_dist_categ)
-        qe_loss_fake =  evaluation_criterion(q_dist_level_fake, y_dist_level)
-
-        q_real_feat = self.F.forward(x_dist)
-        q_dist_categ_real = self.C.forward(q_real_feat)
-        q_dist_level_real = self.E.forward(q_real_feat)
-        qc_loss_real = classification_criterion(q_dist_categ_real, y_dist_categ)
-        qe_loss_real = evaluation_criterion(q_dist_level_real, y_dist_level)
-
-        q_loss = qc_loss_fake + qc_loss_real + qe_loss_fake + qe_loss_real
-        q_loss.backward()
-        self.opt_q.step()
-
-
-        if ret_losses:
-            losses = {'1_G/G_L1': g_loss_l1.detach().cpu(),
-                      '1_G/G_fool_D': g_loss_fooling_d.detach().cpu(),
-                      '1_G/G__loss': g_loss.detach().cpu(),
-
-                      '2_D/D_spot_G': d_spot_g_loss.detach().cpu(),
-                      '2_D/D_spot_real': d_spot_real_loss.detach().cpu(),
-                      '2_D/D__loss': d_loss.detach().cpu(),
-
-                      '3_Q/C_fake': qc_loss_fake.detach().cpu(),
-                      '3_Q/C_real': qc_loss_real.detach().cpu(),
-                      '3_Q/E_fake': qe_loss_fake.detach().cpu(),
-                      '3_Q/E_real': qe_loss_real.detach().cpu(),
-                      '3_Q/Q__loss': q_loss.detach().cpu()
-                      }
-        else:
-            losses = None
-
-        fake_pred = [fake_img, q_fake_feat, d_confidence_fake, q_dist_categ_fake, q_dist_level_fake]
-        real_pred = [x_dist, q_real_feat, d_confidence_real, q_dist_categ_real, q_dist_level_real]
-        return fake_pred, real_pred, losses
-
-
-    def _train_step_pytorch(self, x_ref, x_dist, y_dist_categ, y_dist_level, ret_losses=True):
-        im_shape = x_ref.shape
-
-        wrong = torch.zeros(len(x_ref), 1, device=self.device)
-        correct = torch.ones(len(x_ref), 1, device=self.device)
-        # -----------------
-        #  Train Generator
-        # -----------------
-        #set_requires_grad([self.D, self.F, self.C, self.E], False)
         #set_requires_grad(self.G, True)
-        #fake_img = self.G(x_ref, y_dist_categ, y_dist_level)
+        #set_requires_grad([self.D, self.F, self.C, self.E], False)
         self.opt_g.zero_grad()
+
+        # Generate Fake Image
         z_noise = self.generate_znoise_vector(im_shape)
         fake_img = self.generator_step(x_ref, y_dist_categ, y_dist_level, z_noise)
         fake_feat = self.F.forward(fake_img)
-        fake_confidence = self.D.forward(fake_feat)
+        # Discriminator Critic
+        fake_critic = self.D.forward(fake_feat).mean()
+        fake_critic.backward(self.__mone, retain_graph=True)
+        cost_g = -fake_critic
+
+        # Classifier
         fake_dist_categ = self.C.forward(fake_feat)
+        loss_c_fake = self._classification_criterion(fake_dist_categ, y_dist_categ[:, 0])
+        # Evaluator
         fake_dist_lvl = self.E.forward(fake_feat)
+        loss_e_fake = self._evaluation_criterion(fake_dist_lvl, y_dist_level)
+        # Reconstruction
+        loss_g_l1 = self._reconstruction_criterion(fake_img, x_dist) * 255 * WGADA.G_LAMBDA_RECONSTRUCTION
 
-        adversarial_criterion = nn.BCELoss()
-        classification_criterion = nn.CrossEntropyLoss()
-        reconstruction_criterion =  lambda im_pred, im_true: (im_pred-im_true).abs().mean()
-        evaluation_criterion = lambda y_pred, y_true: (y_pred-y_true).abs().mean()
-        #evaluator_criterion = lambda y_pred, y_true:  NN.mse_loss(y_pred, y_true)
+        aux_loss = loss_c_fake + loss_e_fake + loss_g_l1
+        aux_loss.backward()
 
-
-        loss_g_l1 = reconstruction_criterion(fake_img, x_dist) * GADA.G_LAMBDA_RECONSTRUCTION
-        loss_g_e_fake = evaluation_criterion(fake_dist_lvl, y_dist_level)
-        loss_g_fooling_d = adversarial_criterion(fake_confidence, correct)
-        loss_g_c_fake = classification_criterion(fake_dist_categ, y_dist_categ[:,0])
-
-        #loss_g = loss_g_fooling_d/2 + (loss_g_l1 + loss_g_c_fake + loss_g_e_fake)/2
-
-        loss_g = 2*(loss_g_fooling_d/2) + 1*(loss_g_l1/4 + loss_g_c_fake/8 + loss_g_e_fake/8)
-        loss_g.backward()
         self.opt_g.step()
 
+        if ret_losses:
+            losses = {'critic/gen': fake_critic.detach().cpu(),
+                      'class/gen': loss_c_fake.detach().cpu(),
+                      'eval/gen': loss_e_fake.detach().cpu(),
+                      'reconstruction': loss_g_l1.detach().cpu(),
+                      'loss/cost_g': cost_g.detach().cpu()}
+        else:
+            losses = None
 
-        # ---------------------
-        #  Train Discriminator
-        # ---------------------
+        fake_pred = [fake_img, fake_feat, fake_critic, fake_dist_categ, fake_dist_lvl]
+        return fake_pred, losses
+
+
+    def critic_train_step(self, x_ref, x_dist, y_dist_categ, y_dist_level, ret_losses=True):
+        """
+
+        :param x_ref:
+        :param x_dist:
+        :param y_dist_categ:
+        :param y_dist_level:
+        :param ret_losses:
+        :return:
+        """
+        im_shape = x_ref.shape
         #set_requires_grad(self.G, False)
         #set_requires_grad([self.D, self.F, self.C, self.E], True)
         self.opt_d.zero_grad()
 
-        # Loss for real images
+        if self.wgan_mode==WGANMode.clipping:
+            for p in self.D.parameters():
+                p.data.clamp_(-self._clipping_value, self._clipping_value)
+        # Train with real images
         real_feat = self.F.forward(x_dist)
-        real_confidence = self.D.forward(real_feat)
+        real_critic = self.D.forward(real_feat).mean()
         real_dist_categ = self.C.forward(real_feat)
         real_dist_lvl = self.E.forward(real_feat)
+        real_critic.backward(self.__mone, retain_graph=True)
 
-        loss_d_detect_real = adversarial_criterion(real_confidence, correct)
-        loss_c_real = classification_criterion(real_dist_categ, y_dist_categ[:,0])
-        loss_e_real = evaluation_criterion(real_dist_lvl, y_dist_level)
-        #loss_dce_real = loss_d_detect_real + loss_c_real + loss_e_real
-
-        # Loss for fake images
+        # Train with generated images
+        z_noise = self.generate_znoise_vector(im_shape)
+        fake_img = self.generator_step(x_ref, y_dist_categ, y_dist_level, z_noise)
         fake_feat = self.F.forward(fake_img.detach())  # stop backprop to the generator by detaching fake_img
-        fake_confidence = self.D.forward(fake_feat)
+        fake_critic = self.D.forward(fake_feat).mean()
         fake_dist_categ = self.C.forward(fake_feat)
         fake_dist_lvl = self.E.forward(fake_feat)
+        fake_critic.backward(self.__one, retain_graph=True)
 
-        loss_d_detect_g = adversarial_criterion(fake_confidence, wrong)
-        loss_c_fake = classification_criterion(fake_dist_categ, y_dist_categ[:,0])
-        loss_e_fake = evaluation_criterion(fake_dist_lvl, y_dist_level)
-        #loss_dce_fake = loss_d_detect_g + loss_c_fake + loss_e_fake
+        if self.wgan_mode==WGANMode.penalty:
+            # gradient penalty
+            gradient_penalty = calc_gradient_penalty(self.D, real_feat, fake_feat, #real_feat, fake_feat,
+                                                     batch_size=x_dist.shape[0], lmbda=self._grad_penalty_lambda, device=self.device)
+            gradient_penalty.backward()
+        else:
+            gradient_penalty = torch.Tensor([0]).mean()
+        # Classifier and Evaluator losses
+        loss_c_real = self._classification_criterion(real_dist_categ, y_dist_categ[:,0])
+        loss_e_real = self._evaluation_criterion(real_dist_lvl, y_dist_level)
+        aux_loss_real = loss_c_real + loss_e_real
+        aux_loss_real.backward()
 
-        #loss_dce = loss_dce_real/2 + loss_dce_fake/2
-        #loss_dce = loss_dce_real + loss_dce_fake
+        # loss_c_fake = self._classification_criterion(fake_dist_categ, y_dist_categ[:, 0])
+        # loss_e_fake = self._evaluation_criterion(fake_dist_lvl, y_dist_level)
+        # aux_loss_fake = loss_c_fake + loss_e_fake
+        # aux_loss_fake.backward()
 
-
-        loss_c = loss_c_real
-        loss_e = loss_e_real
-        #loss_c = (loss_c_real + loss_c_fake)/2
-        #loss_e = (loss_e_real + loss_e_fake)/2
-        loss_dce = loss_d_detect_g/4  + loss_d_detect_real/4 + loss_c/4 + loss_e/4
-        loss_dce.backward()
         self.opt_d.step()
+
+        wasserstein_dist = real_critic - fake_critic
+        cost_d = fake_critic - real_critic + gradient_penalty
 
 
 
         if ret_losses:
-            losses = {'1_G/G_L1': loss_g_l1.detach().cpu(),
-                      '1_G/G_fool_D': loss_g_fooling_d.detach().cpu(),
-                      '1_G/G__loss': loss_g.detach().cpu(),
+            losses = {'critic/real': real_critic.detach().cpu(),
+                      'critic/fake': fake_critic.detach().cpu(),
+                      'class/real': loss_c_real.detach().cpu(),
+                      'eval/real': loss_e_real.detach().cpu(),
+                      #'class/fake': loss_c_fake.detach().cpu(),
+                      #'eval/fake': loss_e_fake.detach().cpu(),
 
-                      '2_D/D_spot_G': loss_d_detect_g.detach().cpu(),
-                      '2_D/D_spot_real': loss_d_detect_real.detach().cpu(),
-                      '2_D/D__loss': (loss_d_detect_g+loss_d_detect_real).detach().cpu(),
-
-                      '3_Q/C_fake': loss_c_fake.detach().cpu(),
-                      '3_Q/C_real': loss_c_real.detach().cpu(),
-                      '3_Q/E_fake': loss_e_fake.detach().cpu(),
-                      '3_Q/E_real': loss_e_real.detach().cpu(),
-                      '3_Q/Q__loss': loss_dce.detach().cpu()
-                      }
+                      'loss/wdist': wasserstein_dist.detach().cpu(),
+                      'loss/cost_d': cost_d.detach().cpu()}
         else:
             losses = None
-
-        fake_pred = [fake_img, fake_feat, fake_confidence, fake_dist_categ, fake_dist_lvl]
-        real_pred = [x_dist, real_feat, real_confidence, real_dist_categ, real_dist_lvl]
+        fake_pred = [fake_img, fake_feat, fake_critic, fake_dist_categ, fake_dist_lvl]
+        real_pred = [x_dist, real_feat, real_critic, real_dist_categ, real_dist_lvl]
         return fake_pred, real_pred, losses
 
-
-    def train_step_evaluator(self, x, y_dist_categ, y_dist_level, train_classifier=True):
-
-        evaluation_criterion = lambda y_pred, y_true: (y_pred-y_true).abs().mean()
-        classification_criterion = nn.CrossEntropyLoss()
-
-        #set_requires_grad(self.G, False)
-        #set_requires_grad([self.D, self.F, self.C, self.E], True)
-        self.opt_d.zero_grad()
-
-        feat = self.F.forward(x)
-        dist_lvl = self.E.forward(feat)
-        dist_categ = self.C.forward(feat)
-        loss_e = evaluation_criterion(dist_lvl, y_dist_level)
-        loss_c = torch.Tensor([0.]).to(self.device)
-        if train_classifier:
-            loss_c = classification_criterion(dist_categ, y_dist_categ[:, 0])
-        loss = loss_e*4 + loss_c
-        loss.backward()
-        self.opt_d.step()
-        return loss_e.detach().cpu(), loss_c.detach().cpu()
 
 
 import numpy as np
@@ -451,7 +353,7 @@ def write_dict_summary(d: dict, writer: SummaryWriter, step):
         for k, v in d.items():
             writer.add_scalar(k, v, step)
 
-def finetune_GADA(gada: GADA,
+def finetune_WGADA(gada: WGADA,
                   trainset: GADAsetFactory,
                   testset: GADAsetFactory,
                   gen_dist_from_trainset: bool,
@@ -550,7 +452,7 @@ def finetune_GADA(gada: GADA,
 
         if epoch%test_period == 0:
             print("TESTING ...")
-            lcc, srocc = test_GADA(gada, test_loader=test_loader, bs=test_bs, crop_dim=crop_dim, data_in_gpu=data_in_gpu, verbose=0)
+            lcc, srocc = test_WGADA(gada, test_loader=test_loader, bs=test_bs, crop_dim=crop_dim, data_in_gpu=data_in_gpu, verbose=0)
             if epoch_summary_writer is not None:
                 epoch_summary_writer.add_scalar('test/lcc', lcc, epoch)
                 epoch_summary_writer.add_scalar('test/srocc', srocc, epoch)
@@ -562,33 +464,31 @@ def finetune_GADA(gada: GADA,
             torch.save(gada.state_dict(), join(state_dir, f'gada-[ep={epoch}]'))
 
 
-
-
-
-def train_GADA(gada: GADA,
-               trainset: GADAsetFactory,
-               testset: GADAsetFactory,
-               #opt_fn: Callable[[Iterator], torch.optim.Optimizer],
-               nb_epochs=1000,
-               bs=64,
-               crop_dim=128,
-               test_bs=None,
-               test_period=50,
-               data_in_gpu=False,
-               log_dir='./logs/',
-               state_dir='./weights/',
-               first_save_state_epoch=0,
-               save_state_interval=50,
-               jpeg_grid=True):
+def train_WGADA(wgada: WGADA,
+                trainset: GADAsetFactory,
+                testset: GADAsetFactory,
+                # opt_fn: Callable[[Iterator], torch.optim.Optimizer],
+                nb_epochs=1000,
+                bs=64,
+                crop_dim=128,
+                test_bs=None,
+                test_period=50,
+                data_in_gpu=False,
+                log_dir='./logs/',
+                state_dir='./weights/',
+                first_save_state_epoch=0,
+                save_state_interval=50,
+                nb_critic_iter=5,
+                jpeg_grid=True):
 
     test_bs = bs if test_bs is None else test_bs
     num_workers = 3
     if data_in_gpu:
-        train_dataset = trainset.tensor_dataset(crop_dim, device=gada.device, jpeg_grid=jpeg_grid)
+        train_dataset = trainset.tensor_dataset(crop_dim, device=wgada.device, jpeg_grid=jpeg_grid)
         trainset.drop_images()
         train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True, num_workers=num_workers, pin_memory=False, drop_last=True)
-        #
-        test_dataset = testset.tensor_dataset(crop_dim, device=gada.device, jpeg_grid=jpeg_grid)
+
+        test_dataset = testset.tensor_dataset(crop_dim, device=wgada.device, jpeg_grid=jpeg_grid)
         testset.drop_images()
         test_loader =  DataLoader(test_dataset, batch_size=test_bs, shuffle=False, num_workers=num_workers, pin_memory=False)
 
@@ -601,13 +501,9 @@ def train_GADA(gada: GADA,
         testset.drop_images()
         test_loader =  DataLoader(test_dataset, batch_size=test_bs, shuffle=False, num_workers=num_workers, pin_memory=True)
 
-
-    #opt = torch.optim.Adam(gada.parameters(), lr=0.0001, betas=(0.5, 0.999)) if opt_fn is None else opt_fn(gada.parameters())
-
     timestamp = datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d_%H:%M:%S')
     if log_dir is not None:
-        #batch_summary_writer = SummaryWriter(join(log_dir, timestamp, 'batch'))
-        batch_summary_writer=None
+        batch_summary_writer=None # SummaryWriter(join(log_dir, timestamp, 'batch'))
         epoch_summary_writer = SummaryWriter(join(log_dir, timestamp))
     else:
         batch_summary_writer = epoch_summary_writer = None
@@ -616,46 +512,51 @@ def train_GADA(gada: GADA,
         from os import makedirs
         state_dir = join(state_dir, timestamp)
         makedirs(state_dir, exist_ok=True)
-        torch.save(gada.state_dict(), join(state_dir, f'gada-[ep=0]'))
+        torch.save(wgada.state_dict(), join(state_dir, f'gada-[ep=0]'))
 
-
+    assert 0 < nb_critic_iter < len(train_loader)
+    critic_counter = 0
     for epoch in range(1, nb_epochs+1):
-        nb_batches = len(train_loader)
-        epoch_losses = []
+        critic_losses = []
+        generator_losses = []
+
         epoch_start_time = time.time()
-        gada.train()
+        wgada.train()
         for batch, (x_ref, x_dist, y_dist_categ, y_dist_level, id) in enumerate(train_loader):
             if data_in_gpu:
                 x_ref, x_dist, y_dist_level = to_float32(x_ref, x_dist, y_dist_level)
             else:
-                x_ref, x_dist, y_dist_level = to_device(*to_float32(x_ref, x_dist, y_dist_level), device=gada.device)
-                y_dist_categ = y_dist_categ.to(gada.device)
+                x_ref, x_dist, y_dist_level = to_device(*to_float32(x_ref, x_dist, y_dist_level), device=wgada.device)
+                y_dist_categ = y_dist_categ.to(wgada.device)
 
-            #x_ref /= 255.
-            #x_dist /= 255.
+            if critic_counter < nb_critic_iter:
+                critic_counter += 1
+                fake_pred, real_pred, c_losses = wgada.critic_train_step(x_ref, x_dist, y_dist_categ, y_dist_level, ret_losses=True)
+            else:
+                critic_losses.append(c_losses)
+                critic_counter = 0
+                fake_pred, g_losses = wgada.generator_train_step(x_ref, x_dist, y_dist_categ, y_dist_level, ret_losses=True)
+                generator_losses.append(g_losses)
 
-            #fake_pred, real_pred, losses = gada.train_step_bongini(x_ref, x_dist, y_dist_categ, y_dist_level, ret_losses=True)
-            fake_pred, real_pred, losses = gada.train_step(x_ref, x_dist, y_dist_categ, y_dist_level, ret_losses=True)
-            #write_dict_summary(losses, batch_summary_writer, (epoch-1) * nb_batches + batch + 1)
-            epoch_losses.append(losses)
-
-
-        ep_loss = mean_all_losses(epoch_losses)
-        write_dict_summary(ep_loss, epoch_summary_writer, epoch)
+            #x_ref /= 255.; x_dist /= 255.
+        critic_losses = mean_all_losses(critic_losses)
+        generator_losses = mean_all_losses(generator_losses)
+        write_dict_summary(critic_losses, epoch_summary_writer, epoch)
+        write_dict_summary(generator_losses, epoch_summary_writer, epoch)
         print(f"Epoch[{epoch}/{nb_epochs}] -- Execution Time:  {time.time()-epoch_start_time:.5}s")
        # print(f"Mean losses:  G-l1={ep_loss['1_G/loss_reconstruction']:.4}   G-fool-D={ep_loss['1_G/loss_G_fool_D']:.4}   D-spot-G={ep_loss['2_D/loss_D_spot_G']:.4}")
        # print(f"              sC={ep_loss['3_C/loss']:.4}   E={ep_loss['4_E/loss']:.4}")
         print("")
 
         if epoch%test_period == 0:
-            lcc, srocc = test_GADA(gada, test_loader=test_loader, bs=test_bs, crop_dim=crop_dim, data_in_gpu=data_in_gpu, verbose=0)
+            lcc, srocc = test_WGADA(wgada, test_loader=test_loader, bs=test_bs, crop_dim=crop_dim, data_in_gpu=data_in_gpu, verbose=0)
             if epoch_summary_writer is not None:
                 epoch_summary_writer.add_scalar('test/lcc', lcc, epoch)
                 epoch_summary_writer.add_scalar('test/srocc', srocc, epoch)
 
 
         if  state_dir is not None and epoch > first_save_state_epoch and (epoch-first_save_state_epoch) % save_state_interval == 0:
-            torch.save(gada.state_dict(), join(state_dir, f'gada-[ep={epoch}]'))
+            torch.save(wgada.state_dict(), join(state_dir, f'gada-[ep={epoch}]'))
     #
     # @property
     # def device():
@@ -672,7 +573,7 @@ def IMG(tensor):
 
 
 
-def test_GADA(gada: GADA,
+def test_WGADA(gada: WGADA,
               testset: GADAsetFactory = None,
               test_loader=None,
               bs=64,
@@ -756,20 +657,19 @@ def test_GADA(gada: GADA,
     return lcc_global, srocc_global
 
 
-
-def plot_GADA_gen_imgs(gada: GADA,
-              testset: GADAsetFactory = None,
-              test_loader=None,
-              bs=64,
-              crop_dim=128,
-              data_in_gpu=False,
-              state_path=None,
-                       timestamp=None,
-              verbose=0,
-              imgs_per_plot=4,
-                    skip_batches=0,
-                       filter_dist=tuple(),
-              jpeg_grid=True):
+def plot_WGADA_gen_imgs(gada: WGADA,
+                        testset: GADAsetFactory = None,
+                        test_loader=None,
+                        bs=64,
+                        crop_dim=128,
+                        data_in_gpu=False,
+                        state_path=None,
+                        timestamp=None,
+                        verbose=0,
+                        imgs_per_plot=4,
+                        skip_batches=0,
+                        filter_dist=tuple(),
+                        jpeg_grid=True):
 
     if state_path is not None:
         if timestamp is not None:
