@@ -4,7 +4,8 @@ from datasets.live import LIVE
 from datasets.tid import TID2013
 import numpy as np
 
-from gada.wgada import WGADA, WGANMode
+from gada import GADA
+from wgada import WGADA, WGANMode
 
 
 def exp_init(gpu_index=0, seed=None, use_fixed_seed=True, use_gpu=True):
@@ -60,29 +61,29 @@ crop_dim = 128
 
 GPU = 0
 device = exp_init(gpu_index=GPU, seed=42)
-# gada = GADA(nb_distortions=nb_dist,
-#             z_noise_dim=96,
-#             # g_blocks=(64, 128, 128),                   # 2019-05-16_11:46:39
-#             g_blocks=((64, 1), 128, 128, 256, 256),  # 2019-05-16_18:20:34
-#             # g_blocks=(64, 128, 256, 256),               # 2019-05-16_18:22:37
-#             # g_blocks=((64,1), (64,2), (128, 2), (256, 1), (256, 2)),
-#             target_im_size=crop_dim,
-#             g_disable_skip_connections=False,
-#             device=device)
-
-wgada = WGADA(nb_distortions=nb_dist,
-              z_noise_dim=96,
-              lr=.0004,
-              g_blocks=(64, 128, 128),                   # 2019-05-16_11:46:39
-              #g_blocks=(64, 128, 128, 256, 256),  # 2019-05-16_18:20:34
-              # g_blocks=(64, 128, 256, 256),               # 2019-05-16_18:22:37
-              # g_blocks=((64,1), (64,2), (128, 2), (256, 1), (256, 2)),
-              target_im_size=crop_dim,
-              g_disable_skip_connections=False,
-              grad_penalty_lambda=1,
-              wgan_mode=WGANMode.penalty,
-              use_resize_conv=False,
-              device=device)
+gada = GADA(nb_distortions=nb_dist,
+            z_noise_dim=96,
+            # g_blocks=(64, 128, 128),                   # 2019-05-16_11:46:39
+            g_blocks=((64, 1), 128, 128, 256, 256),  # 2019-05-16_18:20:34
+            # g_blocks=(64, 128, 256, 256),               # 2019-05-16_18:22:37
+            # g_blocks=((64,1), (64,2), (128, 2), (256, 1), (256, 2)),
+            target_im_size=crop_dim,
+            g_disable_skip_connections=False,
+            device=device)
+#
+# wgada = WGADA(nb_distortions=nb_dist,
+#               z_noise_dim=96,
+#               lr=.0004,
+#               g_blocks=(64, 128, 128),                   # 2019-05-16_11:46:39
+#               #g_blocks=(64, 128, 128, 256, 256),  # 2019-05-16_18:20:34
+#               # g_blocks=(64, 128, 256, 256),               # 2019-05-16_18:22:37
+#               # g_blocks=((64,1), (64,2), (128, 2), (256, 1), (256, 2)),
+#               target_im_size=crop_dim,
+#               g_disable_skip_connections=False,
+#               grad_penalty_lambda=1,
+#               wgan_mode=WGANMode.penalty,
+#               use_resize_conv=False,
+#               device=device)
 
 state_timestamp_test = '2019-05-16_18:20:34'
 state_epoch_test = 9000
