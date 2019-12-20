@@ -1,0 +1,132 @@
+
+class Loss:
+    def __init__(self, fake_img_preds, real_img_preds, y_dist_categ, y_dist_level):
+        fake_img, fake_img_confidence, fake_img_dist_type, fake_img_dist_level = fake_img_preds
+        real_img, real_img_confidence, real_img_dist_type, real_img_dist_level = real_img_preds
+
+        self.g_reconstruction_loss = Generator.loss(fake_img, real_img )* GADA.G_LAMBDA_RECONSTRUCTION
+        self.g_fooling_d = Discriminator.loss(fake_img_confidence, torch.zeros_like(fake_img_confidence))
+        self.g_loss = self.g_reconstruction_loss + self.g_fooling_d
+
+        self.d_loss_fake = Discriminator.loss(fake_img_confidence, torch.ones_like(fake_img_confidence))
+        self.d_loss_real = Discriminator.loss(real_img_confidence, torch.zeros_like(real_img_confidence))
+        self.d_loss = self.d_loss_fake + self.d_loss_real
+
+        self.c_loss_fake = Classifier.loss(fake_img_dist_type, y_dist_categ)
+        self.c_loss_real = Classifier.loss(real_img_dist_type, y_dist_categ)
+        # self.c_loss_fake_weighted =  Classifier.loss(fake_img_dist_type, y_dist_categ, weight=(1 - fake_img_confidence))
+        self.ac_loss = self.c_loss_fake * .1 + self.c_loss_real
+
+        self.ev_loss_fake = Evaluator.loss(fake_img_dist_level, y_dist_level)
+        # self.ev_loss_fake_weighted = Evaluator.loss(fake_img_dist_level, y_dist_level, weight=(1-fake_img_confidence))
+        self.ev_loss_real = Evaluator.loss(real_img_dist_level, y_dist_level)
+        self.ev_loss = self.ev_loss_fake * .1 + self.ev_loss_real
+
+        self.loss = self.g_loss + self.d_loss + self.ac_loss  + self.ev_loss
+        # self.loss = self.g_fooling_d + self.d_loss_fake + self.d_loss_real + self.g_reconstruction_loss + \
+        #             self.c_loss_fake_weighted + self.c_loss_real * (fake_img_confidence).mean() + \
+        #             self.ev_loss_fake_weighted + self.ev_loss_real  * (fake_img_confidence).mean()
+
+
+
+    def _field_names(self):
+        return [k for k in self.__dict__.keys() if (not k.startswith('__') and not callable(self.__dict__[k]))]
+
+    def _fields(self):
+        return [self.__dict__[f] for f in self._field_names()]
+
+    def numpy(self):
+        for f in self._field_names():
+            self.__dict__[f] = self.__dict__[f].detach().cpu().numpy()
+        return self
+
+    def cpu(self):
+        for f in self._field_names():
+            self.__dict__[f] = self.__dict__[f].detach().cpu()
+        return self
+
+
+    @staticmethod
+    def sum_all(loss_stats: List) -> 'GADA.Loss':
+        sum =  reduce((lambda a, b: a+ b), loss_stats)
+        return sum
+
+    @staticmethod
+    def mean_all(loss_stats: List) -> 'GADA.Loss':
+        sum = reduce((lambda a, b: a + b), loss_stats)
+        return sum / len(loss_stats)
+
+    def __add__(self, other):
+        res = deepcopy(self)
+        if isinstance(other, GADA.Loss):
+            for f in self._field_names():
+                res.__dict__[f] += other.__dict__[f]
+        else:
+            for f in self._field_names():
+                res.__dict__[f] += other
+        return res
+
+    def __sub__(self, other):
+        res = deepcopy(self)
+        if isinstance(other, GADA.Loss):
+            for f in self._field_names():
+                res.__dict__[f] -= other.__dict__[f]
+        else:
+            for f in self._field_names():
+                res.__dict__[f] -= other
+        return res
+
+    def __mul__(self, other):
+        res = deepcopy(self)
+        if isinstance(other, GADA.Loss):
+            for f in self._field_names():
+                res.__dict__[f] *= other.__dict__[f]
+        else:
+            for f in self._field_names():
+                res.__dict__[f] *= other
+        return res
+
+    def __truediv__(self, other):
+        res = deepcopy(self)
+        if isinstance(other, GADA.Loss):
+            for f in self._field_names():
+                res.__dict__[f] /= other.__dict__[f]
+        else:
+            for f in self._field_names():
+                res.__dict__[f] /= other
+        return res
+
+    def summary_write(s, loss_writer: SummaryWriter, step, tag_1_prepend='', tag_1_append='', tag_2_prepend='', tag_2_append=''):
+        t1p = tag_1_prepend
+        t1a = tag_1_append
+        t2p = tag_2_prepend
+        t2a = tag_2_append
+
+        loss_writer.add_scalar(f'{t1p}1_GADA{t1a}/{t2p}loss_global{t2a}', s.loss, step)
+        loss_writer.add_scalar(f'{t1p}1_GADA{t1a}/{t2p}loss_G_fool_D{t2a}', s.g_fooling_d, step)
+        loss_writer.add_scalar(f'{t1p}1_GADA{t1a}/{t2p}loss_D_spot_G{t2a}', s.d_loss_fake, step)
+
+        loss_writer.add_scalar(f'{t1p}2_GEN{t1a}/{t2p}loss{t2a}', s.g_loss, step)
+        loss_writer.add_scalar(f'{t1p}2_GEN{t1a}/{t2p}loss_reconstruction{t2a}', s.g_reconstruction_loss, step)
+        loss_writer.add_scalar(f'{t1p}2_GEN{t1a}/{t2p}loss_G_fool_D{t2a}', s.g_fooling_d, step)
+
+        loss_writer.add_scalar(f'{t1p}3_DISCR{t1a}/{t2p}loss_D_spot_G{t2a}', s.d_loss_fake, step)
+        loss_writer.add_scalar(f'{t1p}3_DISCR{t1a}/{t2p}loss_D_spot_real_imgs{t2a}', s.d_loss_real, step)
+        loss_writer.add_scalar(f'{t1p}3_DISCR{t1a}/{t2p}loss{t2a}', s.d_loss, step)
+
+        loss_writer.add_scalar(f'{t1p}4_CLASS{t1a}/{t2p}loss_fake_imgs{t2a}', s.c_loss_fake, step)
+        # loss_writer.add_scalar(f'{t1p}4_CLASS{t1a}/{t2p}loss_fake_imgs_confidence_weighted{t2a}', s.c_loss_fake_weighted, step)
+        loss_writer.add_scalar(f'{t1p}4_CLASS{t1a}/{t2p}loss_real_imgs{t2a}', s.c_loss_real, step)
+        loss_writer.add_scalar(f'{t1p}4_CLASS{t1a}/{t2p}loss{t2a}', s.ac_loss, step)
+
+        loss_writer.add_scalar(f'{t1p}5_EV{t1a}/{t2p}loss_fake_imgs{t2a}', s.ev_loss_fake, step)
+        # loss_writer.add_scalar(f'{t1p}5_EV{t1a}/{t2p}loss_fake_imgs_confidence_weighted{t2a}', s.ev_loss_fake_weighted, step)
+        loss_writer.add_scalar(f'{t1p}5_EV{t1a}/{t2p}loss_real_imgs{t2a}', s.ev_loss_real, step)
+        loss_writer.add_scalar(f'{t1p}5_EV{t1a}/{t2p}loss{t2a}', s.ev_loss, step)
+
+
+def forward_w_loss(self, x_ref, x_dist, y_dist_categ, y_dist_level, share_feats=True) -> [[torch.Tensor, torch.Tensor], Loss]:
+    fake_img_preds, real_img_preds = self.forward(x_ref, x_dist, y_dist_categ, y_dist_level, share_feats=share_feats)
+    losses = GADA.Loss(fake_img_preds, real_img_preds, y_dist_categ, y_dist_level)
+    return (fake_img_preds, real_img_preds), losses
+

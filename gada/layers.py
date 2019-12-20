@@ -2,7 +2,11 @@ import torch
 from torch import nn
 from numbers import Number
 from fastorch import fastSequential
-from torch.nn import functional as NN
+from fastorch.summary import summary
+
+from gada.utils import index_to_1hot
+
+
 def NP(tensor):
     return tensor.detach().cpu().numpy()
 
@@ -26,7 +30,7 @@ class PaddingSame2d(nn.Module):
         next_stride = (next_stride, next_stride) if isinstance(next_stride, Number) else next_stride
         next_kernel_size = (next_kernel_size, next_kernel_size) if isinstance(next_kernel_size, Number) else next_kernel_size
         self.stride = next_stride
-        self.filter_size = next_kernel_size
+        self.kernel_size = next_kernel_size
 
     def forward(self, img):
         in_height = img.shape[-2]
@@ -36,146 +40,180 @@ class PaddingSame2d(nn.Module):
 
         #if self.filter_size[0] != in_height: # TODO: does tensorflow make this check?
         if in_height % self.stride[0] == 0:
-            pad_h = max(self.filter_size[0] - self.stride[0], 0)
+            pad_h = max(self.kernel_size[0] - self.stride[0], 0)
         else:
-            pad_h = max(self.filter_size[0] - (in_height % self.stride[0]), 0)
+            pad_h = max(self.kernel_size[0] - (in_height % self.stride[0]), 0)
 
         #if self.filter_size[1] != in_width: # TODO: does tensorflow make this check?
         if in_width % self.stride[1] == 0:
-            pad_w = max(self.filter_size[1] - self.stride[1], 0)
+            pad_w = max(self.kernel_size[1] - self.stride[1], 0)
         else:
-            pad_w = max(self.filter_size[1] - (in_width % self.stride[1]), 0)
+            pad_w = max(self.kernel_size[1] - (in_width % self.stride[1]), 0)
 
         pad_top = pad_h // 2
         pad_bottom = pad_h - pad_top
         pad_left = pad_w // 2
         pad_right = pad_w - pad_left
-        return NN.pad(img, pad=[pad_top, pad_bottom, pad_left, pad_right], mode=self.mode, value=self.const_value)
+        img = NN.pad(img, pad=[pad_top, pad_bottom, pad_left, pad_right], mode=self.mode, value=self.const_value)
+        return img
 
-class PaddedSameConv2d(nn.modules.Conv2d):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, dilation=1, groups=1, bias=True,
-                 pad_mode='replicate', pad_const_value=0):
-        super().__init__(in_channels, out_channels, kernel_size, stride, padding=0, dilation=dilation, groups=groups, bias=bias)
-        self.same_padding=PaddingSame2d(kernel_size, stride, mode=pad_mode, const_value=pad_const_value)
+    def extra_repr(self):
+        return f"kernel_size={self.kernel_size}, stride={self.stride}, mode={self.mode}" \
+                + (f", const_value={self.const_value}" if self.mode is 'constant' else '')
 
-    def forward(self, img):
-        img = self.same_padding(img)
-        return super().forward(img)
+leak = .2
 
 
-def conv_out_size(input_size, filter_size, stride, padding):
-    return (input_size - filter_size + 2 * padding) / stride + 1
+def conv_block(input_channels, nb_filters, downsampling=2, kernel_size=4, batchnorm=True):
+    padding = padding_same(kernel_size, downsampling)
+    block = [nn.Conv2d(input_channels, nb_filters, kernel_size, stride=downsampling, padding=padding),
+             nn.LeakyReLU(leak)]
+    if batchnorm:
+        block += [nn.BatchNorm2d(nb_filters)]
+    return block
 
-
-def conv2d_out_shape(input_size, conv2d: nn.Conv2d):
-    return [conv2d.out_channels,
-            conv_out_size(input_size[0], conv2d.kernel_size[0], conv2d.stride[0], conv2d.padding[0]),
-            conv_out_size(input_size[1], conv2d.kernel_size[1], conv2d.stride[1], conv2d.padding[1])]
-
-
-
-
-
+def deconv_block(input_channels, nb_filters,  upsampling=2, kernel_size=3, output=None):
+    block = []
+    if upsampling > 1:
+        block += [nn.Upsample(scale_factor=upsampling)]
+    block +=     [nn.ReplicationPad2d(padding=padding_same(kernel_size, stride=1)),
+                  nn.Conv2d(input_channels, nb_filters, kernel_size=kernel_size, stride=1, padding=0)]
+    if output is True:
+        block += [nn.Sigmoid()] # todo: remove sigmoid activation from here?
+    else:
+        block += [nn.LeakyReLU(leak), nn.BatchNorm2d(nb_filters)]
+    return block
 
 
 
 class Encoder(nn.Module):
-    def __init__(self, in_channels=3, device=None):
+    def __init__(self, in_channels=3, downsampling_filters=(64, 64, 128, 128), output_batchnorm=False, device=None):
         super().__init__()
         self.device=device
-        self.filters = [64, 128, 128]
-        self.conv1 = nn.Sequential(nn.Conv2d(in_channels, self.filters[0], 4, 2, padding=padding_same(4, 2)),
-                                   nn.LeakyReLU(.2))
-        self.conv2 = nn.Sequential(nn.Conv2d(self.filters[0], self.filters[1], 4, 2, padding_same(4, 2)),
-                                   nn.BatchNorm2d(self.filters[1]),
-                                   nn.LeakyReLU(.2))
-        self.conv3 = nn.Sequential(nn.Conv2d(self.filters[1], self.filters[2], 4, 2, padding_same(4, 2)),
-                                   nn.BatchNorm2d(self.filters[2]),
-                                   nn.LeakyReLU(.2))
+        self.filters = downsampling_filters
+
+        in_chs = [in_channels] + list(downsampling_filters[:-1])
+        self.blocks = [conv_block(in_ch, f, batchnorm=True) for in_ch, f in zip(in_chs[:-1], downsampling_filters[:-1])]
+        self.blocks += [conv_block(in_chs[-1], downsampling_filters[-1], batchnorm=output_batchnorm)]
+        self.blocks = nn.Sequential(*[nn.Sequential(*block) for block in self.blocks])
+        self.skip_out=None
+
     def out_channels(self):
         return self.filters[-1]
 
     def forward(self, x):
-        conv1_emb = self.conv1(x)
-        conv2_emb = self.conv2(conv1_emb)
-        conv3_emb = self.conv3(conv2_emb)
-        return  conv1_emb, conv2_emb, conv3_emb
+        outs = []
+        for conv in self.blocks:
+            x = conv(x)
+            outs.append(x)
+        self.skip_out=outs[:-1]
+        return outs[-1]
 
 
 class Decoder(nn.Module):
-    def __init__(self, input_channels, hidden_skip_connection=True, device=None):
+    def __init__(self, input_channels, upsampling_filters=(128, 64, 64, 3), extra_filters=None, skip_connections=True, device=None):
         super().__init__()
         self.device=device
-        filters = [128, 64, 64, 3]
-        m = 2 if hidden_skip_connection else 1
-        self.deconv_3 = nn.Sequential(nn.UpsamplingNearest2d(scale_factor=2),
-                                      nn.ReflectionPad2d(padding=1),
-                                      nn.Conv2d(input_channels, filters[0], kernel_size=3, stride=1, padding=0),
-                                      nn.BatchNorm2d(filters[0]),
-                                      nn.ReLU())
+        self.filters = upsampling_filters
+        m = 2 if skip_connections else 1
+        self.skip_connections = skip_connections
 
-        self.deconv_2 = nn.Sequential(nn.UpsamplingNearest2d(scale_factor=2),
-                                      nn.ReflectionPad2d(padding=1),
-                                      nn.Conv2d(filters[0]*m, filters[1], kernel_size=3, stride=1, padding=0),
-                                      nn.BatchNorm2d(filters[1]),
-                                      nn.ReLU())
+        in_chs = [input_channels] + [flt * m for flt in upsampling_filters[:-1]] # compute channels w or wo skip-connections (from second to last deconv)
 
-        self.deconv_1 = nn.Sequential(nn.UpsamplingNearest2d(scale_factor=2),
-                                      nn.ReflectionPad2d(padding=1),
-                                      nn.Conv2d(filters[1]*m, filters[2], kernel_size=3, stride=1, padding=0),
-                                      nn.BatchNorm2d(filters[2]),
-                                      nn.ReLU())
+        self.extra_blocks = None
+        self.blocks = [deconv_block(in_ch, f) for in_ch, f in zip(in_chs[:-1], upsampling_filters[:-1])]
 
-        # TODO: the out deconv has kernel_size=1?? 1by1 deconv??
-        self.deconv_out = nn.Sequential(nn.Conv2d(filters[2], filters[3], kernel_size=1, stride=1, padding=0),
-                                        nn.Sigmoid())
+        if extra_filters is None or len(extra_filters) == 0:
+            self.blocks += [deconv_block(in_chs[-1], upsampling_filters[-1], output=True)]
+        else:
+            self.extra_blocks = [deconv_block(in_ch, f, upsample=False) for in_ch, f in zip(in_chs[:-1], extra_filters[:-1])]
+            self.extra_blocks += [deconv_block(in_chs[-1], extra_filters[-1], upsample=False, output=True)]
+
+        self.blocks = nn.Sequential(*[nn.Sequential(*block) for block in self.blocks])
+        if self.extra_blocks is not None:
+            self.extra_blocks = nn.Sequential(*[nn.Sequential(*block) for block in self.extra_blocks])
 
     def out_channels(self):
         return self.filters[-1]
 
-    def forward(self, conv1_emb, conv2_emb, conv3_emb):
-        out = self.deconv_3(conv3_emb)
-        out = self.deconv_2(torch.cat((out, conv2_emb), dim=1))
-        out = self.deconv_1(torch.cat((out, conv1_emb), dim=1))
-        out = self.deconv_out(out)
+
+    def forward(self, enc_out, *skip_connection_inputs):
+        out = self.blocks[0](enc_out)
+        if self.skip_connections:
+            for deconv, conv_emb in zip(self.blocks[1:], skip_connection_inputs):
+                out = deconv(torch.cat((out, conv_emb), dim=1))
+        else:
+            for deconv in self.blocks[1:]:
+                out = deconv(out)
+
+        if self.extra_blocks is not None:
+            out = self.extra_blocks(out)
         return out
 
 
+import torch.distributions as tdist
+
 class Generator(nn.Module):
-    def __init__(self, nb_distortion, z_noise_dim, device=None):
+    def __init__(self, nb_dist_categs, z_noise_dim, img_channels=3, filters=(64, 64, 128, 128),
+                 dist_level_out_embedding_size=32, dist_categ_out_embedding_size=32, device=None):
         super().__init__()
-        level_out_emb_size=32
-        categ_out_emb_size=32
         self.z_dim = z_noise_dim
-        self.dist_level_input_embedding, _ = fastSequential([nb_distortion, 'relu', nb_distortion, 'relu'], input_shape=1)
-        self.dist_level_output_embedding, _ = fastSequential([32, 'relu', level_out_emb_size, 'relu'], input_shape=1)
-        self.dist_categ_output_embedding, _ = fastSequential([32, 'relu', categ_out_emb_size, 'relu'], input_shape=nb_distortion)
-        self.encoder = Encoder(in_channels=3+nb_distortion*2)
-        self.decoder = Decoder(input_channels=self.encoder.out_channels()+z_noise_dim+level_out_emb_size+categ_out_emb_size)
+        self.z_noise_distribution = tdist.Normal(0, 0.1) # mean=0, stddev=0.1
+
+        self.nb_dist_categs = nb_dist_categs
+        self.dist_level_out_embedding_size = dist_level_out_embedding_size
+        self.dist_categ_out_embedding_size = dist_categ_out_embedding_size
+        self.dist_level_in_embedding_size = nb_dist_categs
+
+        self.dist_level_in_embedding, _ = fastSequential([nb_dist_categs, 'relu', nb_dist_categs, 'relu'], input_shape=1)
+        self.dist_level_out_embedding, _ = fastSequential([dist_level_out_embedding_size, 'relu', dist_level_out_embedding_size, 'relu'], input_shape=1)
+        self.dist_categ_out_embedding, _ = fastSequential([dist_level_out_embedding_size, 'relu', dist_categ_out_embedding_size, 'relu'], input_shape=nb_dist_categs)
+
+        self.encoder = Encoder(in_channels=img_channels + nb_dist_categs * 2, downsampling_filters=filters)
+
+        self.decoder = Decoder(input_channels=filters[-1] + z_noise_dim + dist_level_out_embedding_size + dist_categ_out_embedding_size,
+                               upsampling_filters= list(filters[:-1][::-1]) + [img_channels],
+                               extra_filters=None)
+
         self.device = device
 
-    def forward(self, img, dist_level, dist_categ):
-        d_level_emb_in = self.dist_level_input_embedding(dist_level)
-        d_categ_level = torch.cat((dist_categ, d_level_emb_in), dim=1)
-        d_categ_level = d_categ_level.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, img.shape[2], img.shape[3])
-        x = torch.cat((img, d_categ_level), dim=1)
+    def summary(self, crop_size=128, in_channels=3, print_params=False):
+        print("\nEncoder: ")
+        x = summary(self.encoder, torch.zeros(2, in_channels+self.nb_dist_categs*2, crop_size, crop_size), print_params=print_params)
+        print("\nDecoder: ")
+
+        decoder_input = torch.zeros((2, x.shape[1]+self.z_dim + self.dist_level_out_embedding_size + self.dist_categ_out_embedding_size, x.shape[2], x.shape[3]))
+        decoder_input = (decoder_input, *(self.encoder.skip_out[::-1])) if self.decoder.skip_connections else x
+        summary(self.decoder, decoder_input, print_params=print_params)
+
+    def forward(self, img, dist_categ, dist_level):
+        dcateg_onehot = index_to_1hot(dist_categ[:, 0].long(), self.nb_dist_categs).float()
+        dlevel_input_emb = self.dist_level_in_embedding(dist_level)
+        dcateg_dlevel_input_emb = torch.cat((dcateg_onehot, dlevel_input_emb), dim=1)
+        dcateg_dlevel_input_emb = dcateg_dlevel_input_emb.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, img.shape[2], img.shape[3])
+        x = torch.cat((img, dcateg_dlevel_input_emb), dim=1)
+        #x = img
+
 
         # Encoding the input image (concatenated with an embedding of distortion level/category)
-        enc1, enc2, enc3 = self.encoder(x)
+        #enc1, enc2, enc3 = self.encoder(x)
+        enc_out = self.encoder(x)
+        enc_skip_out = self.encoder.skip_out
+
 
         # Embedding distortion level and category
-        d_level_emb_out = self.dist_level_output_embedding(dist_level)
-        d_categ_emb_out = self.dist_categ_output_embedding(dist_categ)
+        d_level_emb_out = self.dist_level_out_embedding(dist_level)
+        d_categ_emb_out = self.dist_categ_out_embedding(dcateg_onehot)
         d_categ_level_emb_out = torch.cat((d_categ_emb_out, d_level_emb_out), dim=1)
-        d_categ_level_emb_out = d_categ_level_emb_out.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, enc3.shape[2], enc3.shape[3])
+        d_categ_level_emb_out = d_categ_level_emb_out.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, enc_out.shape[2], enc_out.shape[3])
 
         # Preparing decoder input using the embedding of distortion level/category
         # concatenated to the encoder output and a noise vector.
-        z_noise = torch.rand((enc3.shape[0], self.z_dim, enc3.shape[2], enc3.shape[3])).to(self.device)
-        decoder_input = torch.cat((enc3, d_categ_level_emb_out, z_noise), dim=1)
+        z_noise = self.z_noise_distribution.sample((enc_out.shape[0], self.z_dim, enc_out.shape[2], enc_out.shape[3])).to(self.device)
+        decoder_input = torch.cat((enc_out, d_categ_level_emb_out, z_noise), dim=1)
 
         # Decoding
-        decoded = self.decoder(enc1, enc2, decoder_input)
+        decoded = self.decoder(decoder_input, *(enc_skip_out[::-1]))
         return decoded
 
     @staticmethod
@@ -183,20 +221,48 @@ class Generator(nn.Module):
         return torch.mean(torch.abs(real_dist_img-generated_dist_img))
 
 
+
 class FeatureExtractor(nn.Module):
-    def __init__(self, out_features=1024, device=None):
+    def __init__(self, out_features=1024, filters=(64,128,128), in_channels=3, last_kernel_size=16, device=None):
         super().__init__()
         self.device=device
-        in_ch = 3
-        self.net = nn.Sequential(PaddedSameConv2d(in_ch, 64, kernel_size=4, stride=2), nn.LeakyReLU(.2),
-                                 PaddedSameConv2d(64, 128, kernel_size=4, stride=2), nn.LeakyReLU(.2),
-                                 PaddedSameConv2d(128, 128, kernel_size=4, stride=2), nn.LeakyReLU(.2),
-                                 nn.Conv2d(128, out_features, kernel_size=16, stride=1),
-                                 nn.BatchNorm2d(out_features), nn.LeakyReLU(.2))
+        self.filters = filters
+        in_chs = [in_channels] + list(filters)[:-1]
+
+        layers = []
+        for i, (in_ch, f) in enumerate(zip(in_chs, filters)):
+            layers.append(PaddingSame2d(next_kernel_size=4, next_stride=2, mode='replicate'))
+            layers.append(nn.Conv2d(in_ch, f, kernel_size=4, stride=2))
+            if i > 0:
+                layers.append(nn.BatchNorm2d(f))
+            layers.append(nn.LeakyReLU(leak))
+
+        layers.append(nn.Conv2d(filters[-1], out_features, kernel_size=last_kernel_size, stride=last_kernel_size))
+        layers.append(nn.BatchNorm2d(out_features))
+        layers.append(nn.LeakyReLU(leak))
+
+        self.net = nn.Sequential(*layers)
+        #
+        # self.net = nn.Sequential(PaddedSameConv2d(in_ch, 64, kernel_size=4, stride=2), nn.LeakyReLU(leak),
+        #                          PaddedSameConv2d(64, 128, kernel_size=4, stride=2), nn.BatchNorm2d(128), nn.LeakyReLU(leak),
+        #                          PaddedSameConv2d(128, 128, kernel_size=4, stride=2), nn.BatchNorm2d(128), nn.LeakyReLU(leak),
+        #                          nn.Conv2d(128, out_features, kernel_size=16, stride=1),
+        #                          nn.BatchNorm2d(out_features),
+        #                          nn.LeakyReLU(leak))
+
+        # self.net = nn.Sequential(PaddedSameConv2d(in_ch, 64, kernel_size=4, stride=2), nn.LeakyReLU(leak),
+        #                          PaddedSameConv2d(64, 128, kernel_size=4, stride=2), nn.BatchNorm2d(128), nn.LeakyReLU(leak),
+        #                          PaddedSameConv2d(128, 128, kernel_size=4, stride=2), nn.BatchNorm2d(128), nn.LeakyReLU(leak),
+        #                          nn.Conv2d(128, out_features, kernel_size=16, stride=1),
+        #                          nn.BatchNorm2d(out_features),
+        #                          nn.LeakyReLU(leak))
+
+    def summary(self, crop_size=128, in_channels=3, print_params=False):
+        summary(self, input_size=(in_channels, crop_size, crop_size), print_params=print_params)
 
 
-    def forward(self, *input):
-        return self.net(*input)
+    def forward(self, x):
+        return self.net(x)
 
 
 import torch.nn.functional as NN
@@ -204,11 +270,15 @@ class Discriminator(nn.Module):
     def __init__(self, in_features=1024, device=None):
         super().__init__()
         self.device=device
+        self.in_features=in_features
         self.net = nn.Sequential(nn.Conv2d(in_features, 1, kernel_size=1, stride=1, padding=padding_same(1, 1)),
                                  nn.Sigmoid())
     def forward(self, x):
-        #return torch.sigmoid(torch.mean(self.net(input), dim=[2,3], keepdim=False))
-        return torch.squeeze(torch.squeeze(self.net(x), dim=-1), dim=-1)
+        return torch.mean(self.net(x), dim=[2,3], keepdim=False)
+        #return torch.squeeze(torch.squeeze(self.net(x), dim=-1), dim=-1)
+
+    def summary(self, print_params=False):
+        summary(self, input_size=(self.in_features,1, 1), print_params=print_params)
 
     @staticmethod
     def loss(pred, target):
@@ -216,61 +286,95 @@ class Discriminator(nn.Module):
 
 
 class Classifier(nn.Module):
-    def __init__(self, out_features, in_features=1024, device=None):
+    def __init__(self, nb_classes, in_features=1024, device=None):
         super().__init__()
         self.device=device
+        self.in_features = in_features
+        self.nb_classes = nb_classes
         self.net = nn.Sequential(nn.Conv2d(in_features, 128, kernel_size=1, stride=1, padding=padding_same(1, 1)),
                                  nn.BatchNorm2d(128),
-                                 nn.LeakyReLU(.2),
-                                 nn.Conv2d(128, out_features, kernel_size=1, stride=1, padding=padding_same(1, 1)))
+                                 nn.LeakyReLU(leak),
+                                 nn.Conv2d(128, nb_classes, kernel_size=1, stride=1, padding=padding_same(1, 1)))
+
+    def summary(self, print_params=False):
+        summary(self, input_size=(self.in_features, 1, 1), print_params=print_params)
 
     def forward(self, x):
-        #return torch.mean(self.net(input), dim=[-2, -1], keepdim=False)
-        return torch.squeeze(torch.squeeze(self.net(x), dim=-1), dim=-1)
+        return torch.mean(self.net(x), dim=[-2, -1], keepdim=False)
+        #return torch.squeeze(torch.squeeze(self.net(x), dim=-1), dim=-1)
 
     @staticmethod
-    def loss(pred, target):
+    def loss(pred, target, weight=None):
         if target.shape[-1] > 1:
             target = torch.argmax(target, dim=-1, keepdim=False).long()
-        return NN.cross_entropy(pred, target)
+        else:
+            target = target[:, 0]
+        ce =  NN.cross_entropy(pred, target, reduce=None)
+        if weight is not None:
+            return (ce*weight).mean()
+        else:
+            return ce.mean()
 
 
 class Evaluator(nn.Module):
     def __init__(self, in_features=1024, device=None):
         super().__init__()
         self.device=device
+        self.in_features = in_features
         self.net = nn.Sequential(nn.Conv2d(in_features, 128, kernel_size=1, stride=1, padding=padding_same(1, 1)),
                                  nn.BatchNorm2d(128),
-                                 nn.LeakyReLU(.2),
+                                 nn.LeakyReLU(leak),
                                  nn.Conv2d(128, 1, kernel_size=1, stride=1, padding=padding_same(1, 1)),
                                  #nn.ReLU() ## double-lrelu
-                                 nn.LeakyReLU(.2)
+                                 nn.LeakyReLU(leak)
                                  )
 
     def forward(self, x, out_dis=None):
-        #self.net(torch.cat((x, out_dis), dim=1))
-        #return torch.mean(self.net(x), dim=[-2, -1], keepdim=False)
-        return torch.squeeze(torch.squeeze(self.net(x), dim=-1), dim=-1)
+        return torch.mean(self.net(x), dim=[-2, -1], keepdim=False)
+        #return torch.squeeze(torch.squeeze(self.net(x), dim=-1), dim=-1)
+
+    def summary(self, print_params=False):
+        summary(self, input_size=(self.in_features,1, 1), print_params=print_params)
 
     @staticmethod
-    def loss(pred, target):
-        return NN.mse_loss(pred, target)
+    def loss(pred, target, weight=None):
+        mse = NN.mse_loss(pred, target, reduction='none')
+        if weight is not None:
+            mse *= weight
+        return mse.sum()
 
-
-class CompleteDiscriminator(nn.Module):
-    def __init__(self, nb_distortions, device=None):
-        # Feat-Extractor -> [Discriminator, Classifier, Evaluator]
-        super().__init__()
-        self.device=device
-        self.feature_extractor = FeatureExtractor(out_features=1024, device=device)
-        self.discriminator = Discriminator(in_features=1024, device=device)
-        self.classifier = Classifier(nb_distortions, in_features=1024, device=device)
-        self.evaluator = Evaluator(in_features=1024, device=device)
-
-    def forward(self, x):
-        feat = self.feature_extractor(x)
-        fake_confidence = self.discriminator(feat)
-        dist_type = self.classifier(feat)
-        dist_level = self.evaluator(feat)
-        return fake_confidence, dist_type, dist_level
+#
+# class CompleteDiscriminator(nn.Module):
+#     def __init__(self, feat_extractor: nn.Module, device=None):
+#         super().__init__()
+#         self.device=device
+#         self.feature_extractor = feat_extractor
+#         self.discriminator = Discriminator(in_features=1024, device=device)
+#
+#
+#     def forward(self, x):
+#         feat = self.feature_extractor(x)
+#         fake_confidence = self.discriminator(feat)
+#         dist_type = self.classifier(feat)
+#         dist_level = self.evaluator(feat)
+#         return fake_confidence, dist_type, dist_level
+#
+# #
+#
+# class CompleteDiscriminator(nn.Module):
+#     def __init__(self, nb_dist_categs, device=None):
+#         # Feat-Extractor -> [Discriminator, Classifier, Evaluator]
+#         super().__init__()
+#         self.device=device
+#         self.feature_extractor = FeatureExtractor(out_features=1024, device=device)
+#         self.discriminator = Discriminator(in_features=1024, device=device)
+#         self.classifier = Classifier(nb_dist_categs, in_features=1024, device=device)
+#         self.evaluator = Evaluator(in_features=1024, device=device)
+#
+#     def forward(self, x):
+#         feat = self.feature_extractor(x)
+#         fake_confidence = self.discriminator(feat)
+#         dist_type = self.classifier(feat)
+#         dist_level = self.evaluator(feat)
+#         return fake_confidence, dist_type, dist_level
 
