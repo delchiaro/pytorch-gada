@@ -1,5 +1,5 @@
-from wgada import train_WGADA
-from zrun_settings import device, log_dir, crop_dim, nb_dist, trainset, testset, state_dir, jpeg_grid
+# from wgada import train_WGADA
+from zrun_settings import log_dir, crop_dim, nb_dist, trainset, testset, state_dir, jpeg_grid, exp_init
 from gada import train_GADA
 
 
@@ -7,6 +7,9 @@ from zrun_settings import gada
 
 print(gada.G)
 gada.summary(crop_dim, channels=3, print_params=True)
+
+device = exp_init(gpu_index=0, seed=42)
+gada.to(device)
 
 train_GADA(gada, trainset, testset,  # opt_fn=lambda p: torch.optim.Adam(p),
             nb_epochs=20000, bs=16, crop_dim=crop_dim, jpeg_grid=jpeg_grid,

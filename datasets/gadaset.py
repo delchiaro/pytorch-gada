@@ -9,96 +9,13 @@ import torch
 from abc import ABC, abstractmethod
 import numpy as np
 from torch.utils.data import TensorDataset, Dataset, ConcatDataset
-from torch.nn import functional as NNF
 import multiprocessing as mp
 import pandas as pd
-from typing import Union, Tuple, List
-
-
-class RandomCrop(object):
-    def __init__(self, size, padding=0, pad_if_needed=False, jpeg_grid_alignment=False):
-        if isinstance(size, numbers.Number):
-            self.size = (int(size), int(size))
-        else:
-            self.size = size
-        self.padding = padding
-        self.pad_if_needed = pad_if_needed
-        self.grid_alignment = 8 if jpeg_grid_alignment else 1
-
-    @staticmethod
-    def get_params(img_tensor, output_size, grid_alignment=1):
-        w_dim=-1
-        h_dim=-2
-        h = img_tensor.shape[h_dim]
-        w = img_tensor.shape[w_dim]
-
-        th, tw = output_size
-        if w == tw and h == th:
-            return 0, 0, h, w
-
-        i = random.randint(0, (h-th)//grid_alignment)*grid_alignment
-        j = random.randint(0, (w-tw)//grid_alignment)*grid_alignment
-
-        return i, j, th, tw
-
-    def __call__(self, img_tensor: torch.Tensor):
-        w_dim = -1
-        h_dim = -2
-        from torchvision.transforms import functional as F
-        if self.padding > 0:
-            img_tensor = NNF.pad(img_tensor, self.padding)
-
-        # pad the width if needed
-        if self.pad_if_needed and img_tensor.shape[w_dim] < self.size[h_dim]:
-            img_tensor = NNF.pad(img_tensor, pad=(int((1 + self.shape[h_dim] - img_tensor.shape[w_dim]) / 2), 0))
-        # pad the height if needed
-        if self.pad_if_needed and img_tensor.size[h_dim] < self.shape[w_dim]:
-            img_tensor = F.pad(img_tensor, (0, int((1 + self.shape[w_dim] - img_tensor.shape[h_dim]) / 2)))
-
-        i, j, h, w = self.get_params(img_tensor, self.size, self.grid_alignment)
-        return img_tensor[:, i:i+h, j:j+w]
-        #return F.crop(img_tensor, i, j, h, w)
-
-    def __repr__(self):
-        return self.__class__.__name__ + '(size={0}, padding={1})'.format(self.size, self.padding)
-
-
-
-class UnisonRandomCrop(RandomCrop):
-    def __init__(self, size, padding=0, pad_if_needed=False, jpeg_grid_alignment=False):
-        super().__init__(size, padding, pad_if_needed, jpeg_grid_alignment)
-
-    def __call__(self, img_tensor_tuple: Tuple[torch.Tensor]):
-        channels = [img_tensor.shape[0] for img_tensor in img_tensor_tuple]
-        joined_img_tensor = torch.cat(img_tensor_tuple, dim=0)
-        joined_img_tensor_cropped = super().__call__(joined_img_tensor)
-        img_tensors_cropped = []
-        ch_st = 0
-        for ch in channels:
-            img_tensors_cropped.append(joined_img_tensor_cropped[ch_st:ch_st+ch])
-            ch_st += ch
-        return tuple(img_tensors_cropped)
-
-
-
-
-class ToDevice(object):
-    def __init__(self, device):
-        self.device = device
-    def __call__(self, tensor):
-        return tensor.to(self.device)
-    def __repr__(self):
-        return self.__class__.__name__ + '()'
-
-
-class ToTensor(object):
-    def __call__(self, pic):
-        from torchvision.transforms import functional as F
-        return F.to_tensor(pic)
-    def __repr__(self):
-        return self.__class__.__name__ + '()'
-
+from typing import Union, Tuple, List, Dict
 from imageio import imread
+
+from datasets.utils import ArrayListDataset, StackDataset, ToDevice, ToTensor, UnisonRandomCrop
+
 
 class ImageLoader:
     ref_images = {}
@@ -115,63 +32,6 @@ class ImageLoader:
         return index, ref, dist
 
 
-class StackDataset(Dataset):
-    def __init__(self, datasets):
-        assert all(len(datasets[0]) == len(d) for d in datasets)
-        self.datasets = datasets
-
-    def __getitem__(self, index):
-        #return tuple(d[index] for d in self.datasets)
-        return tuple(col for d in self.datasets for col in d[index])
-
-    def __len__(self):
-        return len(self.datasets[0])
-
-
-class ListOfNumpyArrayDataset(Dataset):
-    def __init__(self, *array_lists, transform_fn=None, global_transform_fn=None):
-        assert all(len(array_lists[0]) == len(img_list) for img_list in array_lists)
-        self.array_lists = array_lists
-        self.transform_fn = transform_fn
-        self.global_transform_fn = global_transform_fn
-
-    def __getitem__(self, index):
-        if self.transform_fn is not None:
-            result = tuple(self.transform_fn(img_list[index]) for img_list in self.array_lists)
-        else:
-            result = tuple(img_list[index] for img_list in self.array_lists)
-        if self.global_transform_fn is not None:
-            result = self.global_transform_fn(result)
-        return result
-
-    def __len__(self):
-        return len(self.array_lists[0])
-
-
-class NumpyArrayDataset(Dataset):
-
-    def __init__(self, *arrays, transform_fn=None, global_transform_fn=None):
-        assert all(len(arrays[0]) == len(array) for array in arrays)
-        self.numpy_arrays = arrays
-        self.transform_fn = transform_fn
-        self.global_transform_fn = global_transform_fn
-
-
-    def __getitem__(self, index):
-        if self.transform_fn is not None:
-            result = tuple(self.transform_fn(array[index]) for array in self.numpy_arrays)
-        else:
-            result = tuple(array[index] for array in self.numpy_arrays)
-        if self.global_transform_fn is not None:
-            result = self.global_transform_fn(result)
-        return result
-
-    def __len__(self):
-        return len(self.numpy_arrays[0])
-
-
-
-
 
 
 class GADAsetFactory(ABC):
@@ -179,6 +39,8 @@ class GADAsetFactory(ABC):
     COL_DISTORTED_NAME = 'distorted_name'
     COL_REFERENCE_NAME = 'reference_name'
     COL_DISTORTION_CATEG = 'distortion_type'
+    COL_DISTORTION_CATEG_NAME = 'distortion_name'
+
     COL_DISTORTION_LEVEL = 'distortion_level'
 
     COL_REFERENCE_INDEX = 'reference_index'
@@ -209,7 +71,7 @@ class GADAsetFactory(ABC):
         metadata = {GADAsetFactory.COL_DISTORTED_NAME: None,
                     GADAsetFactory.COL_REFERENCE_NAME: None,
                     GADAsetFactory.COL_DISTORTION_CATEG: None,
-                    GADAsetFactory.COL_DISTORTION_LEVEL: None}
+                    GADAsetFactory.COL_DISTORTION_CATEG_NAME: None}
         metadata = self._init(metadata, **kwargs)
         ref_image_names = sorted(set(metadata[GADAsetFactory.COL_REFERENCE_NAME]))
         self.ref_data = pd.DataFrame(data={GADAsetFactory.COL_REFERENCE_NAME: ref_image_names}, index=range(first_ref_image_id, len(ref_image_names)+first_ref_image_id))
@@ -217,6 +79,17 @@ class GADAsetFactory(ABC):
         metadata[GADAsetFactory.COL_REFERENCE_INDEX] = [reference_name2index[ref_name] for ref_name in metadata[GADAsetFactory.COL_REFERENCE_NAME]]
         self.data = pd.DataFrame(data=metadata)
         return self
+
+    @abstractmethod
+    def _dist_type_names(self) -> np.ndarray:
+        pass
+
+    def get_dist_name(self, dist_types):
+        d = self._dist_type_names()
+        if isinstance(dist_types, tuple):
+            dist_types = list(dist_types)
+        return d[dist_types]
+
 
     def load_images(self, inplace=True, threads=mp.cpu_count(), verbose=False, **kwargs) -> (List[np.ndarray], List[np.ndarray]):
         """:param inplace: if True the images will be loaded inside the object and this function return self,
@@ -230,7 +103,7 @@ class GADAsetFactory(ABC):
            """
         self._image_loaded=True
         start = time.time()
-        ref_imgs_array, dist_imgs_array = self._load_images(threads, verbose, **kwargs)
+        ref_imgs_array, dist_imgs_array = self._image_loader(threads, verbose, **kwargs)
         if verbose:
             print(f'LOAD IMAGES - DONE: images loaded in {time.time()-start} seconds.')
 
@@ -243,7 +116,7 @@ class GADAsetFactory(ABC):
 
 
     @abstractmethod
-    def _load_images(self, threads, verbose, **kwargs) -> (List[np.ndarray], List[np.ndarray]):
+    def _image_loader(self, threads, verbose, **kwargs) -> (List[np.ndarray], List[np.ndarray]):
         """
 
         :param threads:
@@ -256,7 +129,7 @@ class GADAsetFactory(ABC):
         pass
 
 
-    def _load_images_helper(self, ref_imgs_path, distorted_imgs_path, threads, verbose) -> (np.ndarray, np.ndarray):
+    def _default_image_loeader(self, ref_imgs_path, distorted_imgs_path, threads, verbose) -> (np.ndarray, np.ndarray):
         ref_path = ref_imgs_path
         dist_path = distorted_imgs_path
         if verbose:
@@ -291,26 +164,18 @@ class GADAsetFactory(ABC):
         except:
             pass
 
+    # @property
+    # def metadata_cols(self):
+    #     return GADAsetFactory.COLS_METADATA
+
 
     @property
-    def image_loaded(self):
-        return self._image_loaded
+    def image_loaded(self): return self._image_loaded
 
+    def random_idx(self, n): return np.random.permutation(self.data.index)[:n]
 
-    @property
-    def metadata_cols(self):
-        return GADAsetFactory.COLS_METADATA
-
-
-
-    def random_idx(self, n):
-        return np.random.permutation(self.data.index)[:n]
-
-    def _split_frame(self, idx):
-        return self.data.loc[idx]
-
-    def _random_split_frame(self, n):
-        return self._split_frame(self.random_idx(n))
+    def _split_frame(self, idx): return self.data.loc[idx]
+    def _random_split_frame(self, n): return self._split_frame(self.random_idx(n))
 
     def split_frame(self, idx=None, n_random=None):
         assert (idx is None) != (n_random is None)
@@ -335,14 +200,14 @@ class GADAsetFactory(ABC):
         test = self.split(test_idx)
         return train, test
 
-
-    def random_ref_idx(self, n): # ref stand for reference_images
+    # ref stand for reference_images
+    def random_ref_idx(self, n):
         return np.random.permutation(self.ref_data.index)[:n]
 
-    def _split_frame_by_ref(self, ref_idx): # ref stand for reference_images
+    def _split_frame_by_ref(self, ref_idx):
         return self.data.loc[self.data[GADAsetFactory.COL_REFERENCE_INDEX].isin(ref_idx)]
 
-    def _random_split_frame_by_ref(self, n): # ref stand for reference_images
+    def _random_split_frame_by_ref(self, n):
         return self._split_frame_by_ref(self.random_ref_idx(n))
 
     def split_frame_by_ref(self, ref_idx=None, n_random=None):
@@ -390,44 +255,35 @@ class GADAsetFactory(ABC):
             print(f"Dist level: {row[GADAsetFactory.COL_DISTORTION_LEVEL]}\n")
 
 
-    def reference_images(self):
-        if GADAsetFactory.COL_REFERENCE_IMAGES in self.data.columns:
+    def _get_images(self, col):
+        if col in self.data.columns:
             try:
-                return np.stack(self.data[GADAsetFactory.COL_REFERENCE_IMAGES])
-            except:
-                # If all images are not with the same dimension, return a list not a tensor
-                return list(self.data[GADAsetFactory.COL_REFERENCE_IMAGES])
+                return np.stack(self.data[col])
+            except ValueError:  # if all images are not with the same shape, return a list not a tensor
+                return list(self.data[col])
 
-        #return self.data[COL_REFERENCE_IMAGES]
+
+    def reference_images(self):
+        return self._get_images(GADAsetFactory.COL_REFERENCE_IMAGES)
 
     def distorted_images(self):
-        if GADAsetFactory.COL_DISTORTED_IMAGES in self.data.columns:
-            try:
-                return np.stack(self.data[GADAsetFactory.COL_DISTORTED_IMAGES])
-            except:
-                # If all images are not with the same dimension, return a list not a tensor
-                return list(self.data[GADAsetFactory.COL_DISTORTED_IMAGES])
-        #return self.data[COL_DISTORTED_IMAGES]
+        return self._get_images(GADAsetFactory.COL_DISTORTED_IMAGES)
 
     def distortion_types(self) -> np.ndarray:
         return np.expand_dims(np.array(self.data[GADAsetFactory.COL_DISTORTION_CATEG], dtype=np.long), axis=-1)
-        #return self.data[COL_DISTORTION_TYPE]
 
     def distortion_level(self) -> np.ndarray:
         return np.expand_dims(np.array(self.data[GADAsetFactory.COL_DISTORTION_LEVEL], dtype=np.float32), axis=-1)
-        #return self.data[COL_DISTORTION_LEVEL]
 
     def indices(self):
-        return np.expand_dims(np.array(self.data.index, dtype=np.int32), axis=-1)
-        #return self.data.index
+        return np.expand_dims(np.array(self.data.index, dtype=np.int32), axis=-1)  #return self.data.index
 
     def ref_indices(self):
-        return np.expand_dims(np.array(self.ref_data.index, dtype=np.int32), axis=-1)
-        #return self.data.index
+        return np.expand_dims(np.array(self.ref_data.index, dtype=np.int32), axis=-1)  #return self.data.index
 
     def ref_names(self):
         return np.expand_dims(np.array(self.ref_data[GADAsetFactory.COL_REFERENCE_NAME]), axis=-1)
-        #return self.data.index
+
 
     def save(self, path):
         dir = '/'.join(path.split('/')[:-1])
@@ -481,18 +337,7 @@ class GADAsetFactory(ABC):
     def apply_split_file(self, path):
         return self.load_split(path, inplace=True)
 
-    # def __repr__(self):
-    #     from tabulate import tabulate
-    #     headers = [GADAsetFactory.COL_INDEX] + self.metadata_cols
-    #     not_metadata = set(self.data.columns) - set(self.metadata_cols)
-    #
-    #     ndarrays = [col for col in not_metadata if hasattr(self.data[col][list(self.data[col].keys())[0]], 'shape')]
-    #     not_metadata = not_metadata - set(ndarrays)
-    #
-    #     data = [[id] + [row[col] for col in self.metadata_cols] + [row[col].shape for col in ndarrays] +\
-    #             [type(row[col]) for col in not_metadata] for id, row in self.data.iterrows()] # with pandas DataFrame
-    #     #data = [[id] + [data_var.data for data_var in self.data.isel(index=id).data_vars.values()] for id in self.data.index] # with xarray
-    #     return tabulate(data, headers)
+
     def __repr__(self):
         all_cols = list(self.data.columns)
         if GADAsetFactory.COL_DISTORTED_IMAGES in all_cols:
@@ -506,11 +351,8 @@ class GADAsetFactory(ABC):
 
 
 
-    def generate_ref_splits(self, path, ref_imgs_per_split=5, n_splits=10,
-                            train_name='train',
-                            test_name='test',
-                            first_split_index=1,
-                            save=True):
+    def generate_ref_splits(self, path, ref_imgs_per_split=5, n_splits=10, train_name='train', test_name='test',
+                            first_split_index=1, save=True):
         keys = (train_name, test_name)
         train_test_splits = {i: {k: splt for k, splt in zip(keys, self.train_test_split_by_ref(n_random=ref_imgs_per_split, specify='test'))}
                              for i in range(first_split_index, n_splits+first_split_index)}
@@ -543,13 +385,13 @@ class GADAsetFactory(ABC):
         assert sorted(train.keys()) == sorted(test.keys())
         return {i: {train_name: train[i], test_name: test[i]} for i in train.keys()}
 
-    def tensor_dataset(s, random_crop_size=None, jpeg_grid=False, verbose=True, device=None):
+    def tensor_dataset(self, random_crop_size=None, jpeg_grid=False, verbose=True, device=None):
         from time import time
 
-        if s.image_loaded:
-            ref_imgs, dist_imgs = s.reference_images(), s.distorted_images()
+        if self.image_loaded:
+            ref_imgs, dist_imgs = self.reference_images(), self.distorted_images()
         else:
-            ref_imgs, dist_imgs = s.load_images(inplace=False, verbose=True)
+            ref_imgs, dist_imgs = self.load_images(inplace=False, verbose=True)
 
         if verbose:
             print('Creating torch dataset...')
@@ -562,24 +404,11 @@ class GADAsetFactory(ABC):
         else:
             global_transform = None
 
-        # if isinstance(imgs[0], np.ndarray) and isinstance(imgs[1], np.ndarray):
-        #     # dataset = TensorDatasetGADA(torch.tensor(ref_imgs).to(device),  # ref
-        #     #                             torch.tensor(dist_imgs).to(device),  # dist
-        #     #                             torch.tensor(s.distortion_types(), dtype=torch.long).to(device),
-        #     #                             torch.tensor(s.distortion_level(), dtype=torch.float32).to(device),
-        #     #                             torch.tensor(s.indices()).to(device),
-        #     #                             img_channel_stack_transform=random_crop)
-        #     img_dataset = NumpyArrayDataset(imgs[0], imgs[1], transform_fn=transform, global_transform_fn=global_transform)
-        #     meta_dataset = TensorDataset(torch.tensor(s.distortion_types(), dtype=torch.long).to(device),
-        #                                  torch.tensor(s.distortion_level(), dtype=torch.float32).to(device),
-        #                                  torch.tensor(s.indices()).to(device))
-        #     dataset = StackDataset([img_dataset, meta_dataset])
-        #
-        # else:
-        img_dataset = ListOfNumpyArrayDataset(ref_imgs, dist_imgs, transform_fn=transform, global_transform_fn=global_transform)
-        meta_dataset = TensorDataset(torch.tensor(s.distortion_types(), dtype=torch.long).to(device),
-                                     torch.tensor(s.distortion_level(), dtype=torch.float32).to(device),
-                                     torch.tensor(s.indices()).to(device))
+
+        img_dataset = ArrayListDataset(ref_imgs, dist_imgs, transform_fn=transform, global_transform_fn=global_transform)
+        meta_dataset = TensorDataset(torch.tensor(self.distortion_types(), dtype=torch.long).to(device),
+                                     torch.tensor(self.distortion_level(), dtype=torch.float32).to(device),
+                                     torch.tensor(self.indices()).to(device))
         dataset = StackDataset([img_dataset, meta_dataset])
 
 

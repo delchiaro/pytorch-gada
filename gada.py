@@ -9,8 +9,9 @@ from torch import nn
 
 from fastorch import fastSequential
 from fastorch.summary import summary
-from gada.networks import UNet, FullyConvFeatExtractor, FullyConvFC
-from gada.utils import to_float32, to_device, index_to_1hot
+from mytorch.model import Model
+from networks import UNet, FullyConvFeatExtractor, FullyConvFC
+from utils import to_float32, to_device, index_to_1hot
 from datasets.gadaset import GADAsetFactory
 import time, datetime
 from torch.utils.data import DataLoader
@@ -44,7 +45,7 @@ class TrainStepStyle(Enum):
 #
 #     discr_last_kernel = int(discr_last_kernel)
 #
-class GADA(nn.Module):
+class GADA(Model):
     G_LAMBDA_RECONSTRUCTION = 255
 
 
@@ -59,10 +60,8 @@ class GADA(nn.Module):
                  dist_categ_emb_size=32,
                  discr_last_kernel=None,  # 16 is the default with 3 convs for discriminator, so that 128x128 crops become 16x16 -> 1x1 !
                  train_step_style=TrainStepStyle.pytorch,
-                 g_disable_skip_connections=False,
-                 device=None):
+                 g_disable_skip_connections=False):
         super().__init__()
-        self.device = device
         self.nb_distortions=nb_distortions
         self.target_im_size=target_im_size
         #
@@ -108,8 +107,6 @@ class GADA(nn.Module):
             self.opt_q = torch.optim.Adam(self.parameters(), lr=lr * 1, betas=(0.5, 0.999))
         elif train_step_style is TrainStepStyle.pytorch:
             self.opt_q = None
-
-        self.to(device)
 
 
     def summary(self, crop_size=128, channels=3, print_params=False):
@@ -819,10 +816,19 @@ def plot_GADA_gen_imgs(gada: GADA,
             if remaining < imgs_per_plot:
                 N = remaining
             fig, ax = plt.subplots(N, 3, figsize=(10, N*2))
+
+            cols_titles = ['Reference', 'Distorted', 'Generated']
+            [ax[0, i].set_title(cols_titles[i]) for i in range(3)]
+
             for i in range(N):
+                dist_name = testset.get_dist_name(y_dist_categ.cpu()[i+offset])
+                dist_lvl = float(y_dist_level[i+offset])
+                ax[i, 0].set_ylabel(f'{dist_name}@{dist_lvl:1.2f}')
                 ax[i,0].imshow(refs[i+offset])
                 ax[i,1].imshow(origs[i+offset])
                 ax[i,2].imshow(generated[i+offset])
+
+
             fig.show()
             remaining -= N
             offset+=N

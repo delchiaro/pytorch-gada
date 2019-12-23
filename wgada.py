@@ -7,8 +7,8 @@ from tensorboardX import SummaryWriter
 from torch import nn
 
 from fastorch.summary import summary
-from gada.networks import UNet, FullyConvFeatExtractor, FullyConvFC
-from gada.utils import to_float32, to_device, index_to_1hot
+from networks import UNet, FullyConvFeatExtractor, FullyConvFC
+from utils import to_float32, to_device, index_to_1hot
 from datasets.gadaset import GADAsetFactory
 import time, datetime
 from torch.utils.data import DataLoader

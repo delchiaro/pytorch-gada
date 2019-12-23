@@ -1,11 +1,14 @@
-
 from pathlib import Path
-import numpy as np
+from typing import Dict
 
+import numpy as np
 from datasets.gadaset import GADAsetFactory
 
 
 class LIVE(GADAsetFactory):
+
+    def _dist_type_names(self) -> np.ndarray:
+        return np.array(['jp2K', 'jpeg', 'wn', 'gblur', 'fastfading'])
 
     def __init__(self, dataset_path, load_dataset=False):
         self.path = Path(dataset_path)
@@ -29,7 +32,8 @@ class LIVE(GADAsetFactory):
             ordering = np.argsort(new_names)
             return list(np.array(names)[ordering])
 
-        dist_im_names = np.array(get_fnames('jp2K') + get_fnames('jpeg') + get_fnames('wn') +  get_fnames('gblur') + get_fnames('fastfading'))
+        dist_im_names = np.array(get_fnames('jp2K') + get_fnames('jpeg') + get_fnames('wn') +
+                                 get_fnames('gblur') + get_fnames('fastfading'))
 
         # dmos = [dmos_jpeg2000(1:227) dmos_jpeg(1:233) white_noise(1:174) gaussian_blur(1:174) fast_fading(1:174)]
         # where dmos_distortion(i) is the dmos value for image "distortion\imgi.bmp" where distortion can be one of the five described above
@@ -61,10 +65,10 @@ class LIVE(GADAsetFactory):
                     GADAsetFactory.COL_DISTORTION_LEVEL: dist_level}
         return metadata
 
-    def _load_images(self, threads, verbose, **kwargs):
+    def _image_loader(self, threads, verbose, **kwargs):
         dist_path = self.path
         ref_path = self.path/'refimgs'
-        return self._load_images_helper(ref_path, dist_path, threads, verbose)
+        return self._default_image_loeader(ref_path, dist_path, threads, verbose)
 
     def __repr__(self):
         r = super().__repr__()

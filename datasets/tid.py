@@ -1,5 +1,5 @@
 from pathlib import Path
-
+import numpy as np
 from datasets.gadaset import GADAsetFactory
 
 #
@@ -21,6 +21,9 @@ from datasets.gadaset import GADAsetFactory
 
 class TID2013(GADAsetFactory):
 
+    def _dist_type_names(self) -> np.ndarray:
+        pass # TODO
+
     def __init__(self, dataset_path, load_dataset=False):
         self.path = Path(dataset_path)
         super().__init__(load_dataset)
@@ -34,36 +37,17 @@ class TID2013(GADAsetFactory):
         dist_categ = [int(n.split('.')[0].split('_')[1])-1 for n in dist_im_names]
         #dist_level = [float(n.split('.')[0].split('_')[2])/5 for n in dist_im_names]
 
-        metadata = {TID2013.COL_DISTORTED_NAME: dist_im_names,
-                    TID2013.COL_REFERENCE_NAME: ref_im_names,
-                    TID2013.COL_DISTORTION_CATEG: dist_categ,
-                    TID2013.COL_DISTORTION_LEVEL: dist_level}
+        metadata = {GADAsetFactory.COL_DISTORTED_NAME: dist_im_names,
+                    GADAsetFactory.COL_REFERENCE_NAME: ref_im_names,
+                    GADAsetFactory.COL_DISTORTION_CATEG: dist_categ,
+                    GADAsetFactory.COL_DISTORTION_LEVEL: dist_level}
         return metadata
     #
-    # def _load_images(self, threads, verbose, **kwargs):
-    #     if verbose:
-    #         print(f'Loading image files from folder {self.path}  ...')
-    #     lists = [self.data.index, list(self.data[TID2013.COL_DISTORTED_NAME]), list(self.data[TID2013.COL_REFERENCE_NAME])]
-    #     indices = self.data.index
-    #     args = []
-    #     for i, d, r in zip(*lists):
-    #         if i in indices:
-    #             args.append((i, d, r))
-    #
-    #
-    #     proc = ImageLoader(dist_path, ref_path)
-    #     pool = mp.Pool(threads)
-    #     res = pool.map(proc, args)
-    #
-    #     #idx = [r[0] for r in res]
-    #     dist = [r[1] for r in res]
-    #     ref = [r[2] for r in res]
-    #     return np.array(ref, dtype=np.uint8), np.array(dist, dtype=np.uint8)
 
-    def _load_images(self, threads, verbose, **kwargs):
+    def _image_loader(self, threads, verbose, **kwargs):
         dist_path = self.path/'distorted_images'
         ref_path = self.path/'reference_images'
-        return self._load_images_helper(ref_path, dist_path, threads, verbose)
+        return self._default_image_loeader(ref_path, dist_path, threads, verbose)
 
     def __repr__(self):
         r = super().__repr__()

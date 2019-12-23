@@ -1,5 +1,5 @@
 from datasets.waterloo import WATERLOO
-from gada.gada import finetune_GADA
+from gada import finetune_GADA
 from zrun_settings import crop_dim, gada, testset, state_dir, jpeg_grid
 
 print(gada.G)

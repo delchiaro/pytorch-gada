@@ -60,10 +60,10 @@ class WATERLOO(GADAsetFactory):
     #     ref = [r[2] for r in res]
     #     return np.array(ref, dtype=np.uint8), np.array(dist, dtype=np.uint8)
 
-    def _load_images(self, threads, verbose, **kwargs):
+    def _image_loader(self, threads, verbose, **kwargs):
         dist_path = self.path/'pristine_images'
         ref_path = self.path/'pristine_images'
-        return self._load_images_helper(ref_path, dist_path, threads, verbose)
+        return self._default_image_loeader(ref_path, dist_path, threads, verbose)
 
     def __repr__(self):
         r = super().__repr__()
